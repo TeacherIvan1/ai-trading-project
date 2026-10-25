@@ -1,0 +1,141 @@
+# ==============================================================================
+# BTCUSDT Quantitative Trading System Configuration
+# High-Frequency Data Aggregation, Microstructure Features & Risk Execution
+# ==============================================================================
+
+system:
+  project_name: "btcusdt_quant_system"
+  version: "1.0.0"
+  environment: "production" # "production" | "testnet" | "backtest"
+  log_level: "INFO"
+  timezone: "UTC"
+
+# ------------------------------------------------------------------------------
+# Exchange Endpoints & WebSocket Feeds (Binance Futures)
+# ------------------------------------------------------------------------------
+exchange:
+  name: "binance_futures"
+  symbol: "BTCUSDT"
+  base_asset: "BTC"
+  quote_asset: "USDT"
+  
+  endpoints:
+    # Production endpoints
+    rest_base_url: "https://fapi.binance.com"
+    ws_base_url: "wss://fstream.binance.com"
+    
+    # Testnet endpoints (if environment is set to testnet)
+    testnet_rest_url: "https://testnet.binancefuture.com"
+    testnet_ws_url: "wss://stream.binancefuture.com"
+    
+  streams:
+    depth_stream: "btcusdt@depth@100ms"       # 100ms L2 diff depth feed
+    trade_stream: "btcusdt@aggTrade"          # Aggregated real-time trades
+    ticker_stream: "btcusdt@bookTicker"       # Real-time top of the book (BBO)
+    
+  orderbook:
+    depth_snapshot_limit: 1000                # Snapshot depth limit (5, 10, 20, 50, 100, 500, 1000)
+    reconnect_backoff_base_sec: 1.0           # Exponential backoff base
+    max_reconnect_attempts: 10
+    desync_resync_threshold_events: 5000      # Max buffered messages before triggering fresh snapshot
+    heartbeat_interval_sec: 15.0
+    ping_timeout_sec: 10.0
+
+# ------------------------------------------------------------------------------
+# Dollar Bar Aggregation & Microstructure Parameters
+# ------------------------------------------------------------------------------
+dollar_bars:
+  target_dollar_value: 10000000.0             # $10,000,000 threshold per Dollar Bar
+  dynamic_threshold:
+    enabled: true
+    lookback_window_bars: 50                  # Dynamic EWMA window for adjusting bar threshold
+    min_dollar_value: 5000000.0               # Floor threshold ($5M)
+    max_dollar_value: 25000000.0              # Ceiling threshold ($25M)
+    
+  microstructure_metrics:
+    vpin:
+      enabled: true
+      bucket_size_dollars: 1000000.0          # Volume-Synchronized Probability of Toxicity bucket size
+      num_buckets: 50                         # Window of VPIN buckets
+    kyles_lambda:
+      enabled: true
+      estimation_window_bars: 20              # Lookback window for Kyle's Lambda price impact regression
+      tick_rule_fallback: true                # Lee-Ready / Tick rule fallback for aggressor flag
+
+# ------------------------------------------------------------------------------
+# Feature Generation & Stationarity
+# ------------------------------------------------------------------------------
+features:
+  ffd: # Fractionally Differentiated Features
+    target_adf_pvalue: 0.01                   # Target Augmented Dickey-Fuller p-value for stationarity
+    d_search_range: [0.0, 1.0]                # Fractional order grid search
+    d_step: 0.05
+    memory_threshold_tau: 1e-4                # Weight cutoff for FFD memory retention
+
+  cusum_filter:
+    enabled: true
+    h_multiplier: 0.5                         # Symmetric CUSUM threshold multiplier: h = multiplier * sigma
+    volatility_ewma_span: 100                 # EWMA span for tracking return standard deviation
+
+  volatility_breakout:
+    parkinson_window: 24                      # High-Low Parkinson volatility window
+    garman_klass_window: 24                   # OHLC Garman-Klass volatility window
+    bollinger_bands_period: 20
+    bollinger_bands_std: 2.0
+
+# ------------------------------------------------------------------------------
+# Labeling & Triple-Barrier Framework (AFML)
+# ------------------------------------------------------------------------------
+labeling:
+  triple_barrier:
+    profit_taking_multiplier: 2.0             # Upper horizontal barrier = pt_multiplier * dynamic_sigma
+    stop_loss_multiplier: 1.0                 # Lower horizontal barrier = sl_multiplier * dynamic_sigma
+    max_holding_period_bars: 10               # Vertical barrier (timeout in Dollar Bars)
+    min_return_threshold: 0.0005              # Minimum return to classify non-zero label
+    label_classes: [-1, 0, 1]                 # -1: Stop-loss hit, 0: Vertical barrier, 1: Take-profit hit
+
+# ------------------------------------------------------------------------------
+# Research & CPCV Validation Framework
+# ------------------------------------------------------------------------------
+research:
+  cpcv:
+    n_splits: 6                               # Total chronological groups
+    n_test_splits: 2                          # Test groups per combination (C(6, 2) = 15 paths)
+    embargo_pct: 0.01                         # 1% embargo after test set to eliminate serial correlation leakage
+    purge_overlapping_events: true            # Strict label event time window purging
+    
+  pbo:
+    target_metric: "sharpe_ratio"             # Optimization metric for PBO calculation
+    min_trials: 10                            # Minimum candidate model configurations
+    
+  deflated_sharpe:
+    benchmark_sharpe_annualized: 0.0          # Null hypothesis benchmark SR
+    annualization_factor: 365.25              # Crypto 24/7 continuous annualization (days)
+    confidence_level: 0.95
+
+# ------------------------------------------------------------------------------
+# Execution, Paper Engine & Pre-Trade Risk Gateway (<100us)
+# ------------------------------------------------------------------------------
+execution:
+  mode: "shadow_paper"                        # "shadow_paper" | "live_fapi"
+  latency_simulation:
+    network_latency_ms: 12.5                  # Simulated round-trip latency to Binance AWS Tokyo
+    engine_processing_us: 45                  # Internal risk gateway check latency target (<100us)
+    
+  slippage_model:
+    type: "power_law"                         # "fixed" | "linear" | "power_law"
+    spread_cross_penalty_bps: 1.5             # Half-spread immediate crossing cost
+    market_impact_coefficient: 0.1            # Price impact parameter scaled by order size / depth
+    
+  fee_tier:
+    maker_fee_bps: 2.0                        # 0.02% VIP 0 maker fee
+    taker_fee_bps: 4.0                        # 0.04% VIP 0 taker fee
+    bnb_discount_pct: 10.0
+
+  pre_trade_risk_gateway:
+    max_order_value_usd: 500000.0             # Hard order cap: $500,000 per order
+    max_net_position_usd: 1500000.0           # Max open directional exposure: $1,500,000
+    max_drawdown_stop_pct: 2.5                # Circuit breaker: kill all orders if session DD exceeds 2.5%
+    max_orders_per_second: 50                 # Token bucket rate limiter
+    price_collar_pct: 1.0                     # Reject limit orders with price > 1% away from BBO
+    kill_switch_active: false

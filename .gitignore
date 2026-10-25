@@ -1,0 +1,56 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Logs and runtime audit artifacts
+logs/
+*.log
+*.jsonl
+
+# Data directories and raw tick/aggTrade downloads
+data/
+cache_zips/
+*.zip
+*.tar.gz
+*.csv
+
+# Sensitive credentials & environment variables
+config/credentials.yaml
+credentials.yaml
+secrets.yaml
+*.secret
+.env
+.env.*
+*.key
+*.pem
+
+# Models & binaries: ignore any file exceeding 50MB
+# Note: models/ignition_meta_rf.pkl (~488KB) and models/warmup_bars.parquet (~56KB) are tracked
+*.h5
+*.onnx
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Testing & build
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
