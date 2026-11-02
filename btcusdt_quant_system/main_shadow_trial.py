@@ -409,9 +409,28 @@ class LiveShadowTrialRunner:
                     # Route order to Binance Futures Testnet if in testnet mode
                     if self.testnet_client:
                         try:
+                            # 1. Enforce Programmatic Leverage & Margin Type (Capped strictly at 3x max)
+                            rec_lev = 2
+                            if deliberation and hasattr(deliberation, "proposal") and deliberation.proposal:
+                                try:
+                                    rec_lev = int(round(deliberation.proposal.recommended_leverage))
+                                except Exception:
+                                    rec_lev = 2
+                            rec_lev = max(1, min(rec_lev, 3))
+
+                            try:
+                                await self.testnet_client.set_margin_type(symbol, "ISOLATED")
+                                await self.testnet_client.set_leverage(symbol, rec_lev)
+                            except Exception as le:
+                                print(f"[TESTNET] Margin/leverage config for {symbol}: {le}", flush=True)
+
+                            # 2. Portfolio Capital Cap & Sizing Governor (Max 10% notional per single position)
                             raw_qty = float(decision.get("qty_btc", 0.001))
+                            max_single_notional = self.risk_engine.equity * 0.10
+                            if raw_qty * limit_price > max_single_notional:
+                                raw_qty = max_single_notional / limit_price
                             if raw_qty * limit_price < 50.0:
-                                raw_qty = 55.0 / limit_price
+                                raw_qty = min(55.0 / limit_price, max_single_notional / limit_price)
                             qty = format_order_qty(symbol, raw_qty)
 
                             testnet_order = await self.testnet_client.place_order(
@@ -433,9 +452,11 @@ class LiveShadowTrialRunner:
                                 "side": "BUY" if target_side == 1 else "SELL",
                                 "price": limit_price,
                                 "qty": qty,
+                                "leverage": rec_lev,
+                                "margin_type": "ISOLATED",
                                 "raw_response": testnet_order
                             })
-                            print(f"[TESTNET ORDER ROUTED] {symbol} orderId={order_id} | status={exch_status} | price={limit_price:.2f} | qty={qty}", flush=True)
+                            print(f"[TESTNET ORDER ROUTED] {symbol} orderId={order_id} | status={exch_status} | price={limit_price:.2f} | qty={qty} | lev={rec_lev}x [ISOLATED]", flush=True)
                         except Exception as e:
                             print(f"[TESTNET ROUTE ERROR] {symbol}: {e}", flush=True)
                             self._log_event("TESTNET_ORDER_ROUTED", {
@@ -448,7 +469,7 @@ class LiveShadowTrialRunner:
                                 "qty": decision.get("qty_btc", 0.001)
                             })
                 elif dec_status == "FILTERED":
-                    order_status = "FILTERED_BY_META_PROB"
+                    order_status = f"FILTERED_{decision.get('reason', 'BY_RISK_ENGINE')}"
                 else:
                     order_status = f"{decision.get('status')}_{decision.get('reason', '')}"
 
@@ -506,8 +527,63 @@ class LiveShadowTrialRunner:
                 except Exception:
                     pass
 
+    async def _orphan_order_cleaner_loop(self):
+        """
+        Periodic 60-second order hygiene worker:
+        Queries /fapi/v1/openOrders and cancels any limit order that has been open
+        for more than 30 minutes without filling.
+        """
+        while True:
+            try:
+                await asyncio.sleep(60.0)
+                if not self.testnet_client:
+                    continue
+                open_orders = await self.testnet_client.get_open_orders()
+                if not open_orders:
+                    continue
+                now_ms = int(time.time() * 1000)
+                threshold_ms = 30 * 60 * 1000  # 30 minutes
+                for order in open_orders:
+                    order_time = int(order.get("time", order.get("updateTime", now_ms)))
+                    if now_ms - order_time > threshold_ms:
+                        o_sym = order.get("symbol")
+                        o_id = order.get("orderId")
+                        print(f"[GARBAGE COLLECTOR] Cancelling stale orphan order {o_id} on {o_sym} (age > 30m)", flush=True)
+                        try:
+                            res = await self.testnet_client.cancel_order(o_sym, o_id)
+                            self._log_event("ORPHAN_ORDER_CANCELLED", {
+                                "symbol": o_sym,
+                                "orderId": o_id,
+                                "age_minutes": round((now_ms - order_time) / 60000.0, 1),
+                                "result": res
+                            })
+                        except Exception as ce:
+                            print(f"[GARBAGE COLLECTOR ERROR] Failed to cancel order {o_id} on {o_sym}: {ce}", flush=True)
+            except Exception as e:
+                print(f"[GARBAGE COLLECTOR LOOP ERROR] {e}", flush=True)
+
     async def run_forever(self):
         asyncio.create_task(self._background_deliberation_loop())
+        asyncio.create_task(self._orphan_order_cleaner_loop())
+
+        if self.testnet_client:
+            print(f"[TESTNET INIT] Syncing account equity & enforcing 2x ISOLATED margin...", flush=True)
+            try:
+                bal = await self.testnet_client.get_usdt_balance()
+                if bal and "total_balance" in bal:
+                    self.risk_engine.equity = float(bal["total_balance"])
+                    self.risk_engine.high_water_mark = max(self.risk_engine.high_water_mark, self.risk_engine.equity)
+                    print(f"[TESTNET INIT] Synced equity: ${self.risk_engine.equity:.2f} USDT", flush=True)
+            except Exception as be:
+                print(f"[TESTNET INIT] Balance sync warning: {be}", flush=True)
+
+            for s in self.symbols:
+                try:
+                    await self.testnet_client.set_margin_type(s, "ISOLATED")
+                    await self.testnet_client.set_leverage(s, 2)
+                except Exception as me:
+                    print(f"[TESTNET INIT] Margin/leverage warning on {s}: {me}", flush=True)
+
         while True:
             try:
                 mode_label = "TESTNET" if self.is_testnet else "PRODUCTION"
@@ -566,6 +642,8 @@ class LiveShadowTrialRunner:
                             )
                             if closed_trade is not None:
                                 self._log_event("SHADOW_POSITION_CLOSED", {**closed_trade, "symbol": symbol})
+                                if self.testnet_client:
+                                    asyncio.create_task(self.testnet_client.cancel_all_open_orders(symbol))
                                 print(
                                     f"[TRADE CLOSED (INTRABAR)] Symbol={symbol} Reason={closed_trade['exit_reason']} | "
                                     f"ExitPrice={closed_trade['exit_price']} | NetReturn={closed_trade['net_return_bps']}bps | "
@@ -591,6 +669,8 @@ class LiveShadowTrialRunner:
                                 )
                                 if closed_trade_bar is not None:
                                     self._log_event("SHADOW_POSITION_CLOSED", {**closed_trade_bar, "symbol": symbol})
+                                    if self.testnet_client:
+                                        asyncio.create_task(self.testnet_client.cancel_all_open_orders(symbol))
                                     print(
                                         f"[TRADE CLOSED (BAR CLOSE)] Symbol={symbol} Reason={closed_trade_bar['exit_reason']} | "
                                         f"ExitPrice={closed_trade_bar['exit_price']} | NetReturn={closed_trade_bar['net_return_bps']}bps | "

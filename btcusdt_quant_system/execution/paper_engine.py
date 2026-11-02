@@ -103,6 +103,10 @@ class SynchronousPreTradeRiskAndPaperEngine:
         if intent.symbol in self.active_positions:
             return {"status": "SKIPPED", "reason": f"POSITION_ALREADY_OPEN_FOR_{intent.symbol}"}
 
+        # 0b. Maximum concurrent open positions check (strict cap of 4 assets)
+        if len(self.active_positions) >= 4:
+            return {"status": "FILTERED", "reason": "MAX_CONCURRENT_POSITIONS_REACHED"}
+
         # 1. Out-of-band Kill Switch Check
         drawdown = (self.high_water_mark - self.equity) / self.high_water_mark if self.high_water_mark > 0 else 0.0
         if drawdown >= self.max_daily_drawdown_pct:
@@ -121,19 +125,39 @@ class SynchronousPreTradeRiskAndPaperEngine:
                 prob_str = f"{intent.meta_prob:.3f}" if intent.meta_prob is not None else "None"
                 return {"status": "FILTERED", "reason": f"LOW_META_PROB ({prob_str} < 0.56)"}
 
+        # 3b. Strict Single Position & Portfolio Capital Governors:
+        # - Max single position notional: 10% of total equity (~$1,300 USDT max)
+        # - Max total portfolio notional: 40% of total equity
+        max_single_notional = self.equity * 0.10
+        current_total_notional = sum(p.notional_usd for p in self.active_positions.values())
+        max_total_notional = self.equity * 0.40
+
+        if current_total_notional >= max_total_notional:
+            return {"status": "FILTERED", "reason": "MAX_PORTFOLIO_NOTIONAL_EXCEEDED"}
+
+        avail_notional = max(0.0, max_total_notional - current_total_notional)
+        target_notional = self.equity * alloc_frac
+        notional_usd = min(target_notional, max_single_notional, avail_notional)
+
+        if notional_usd < 5.0:
+            return {"status": "FILTERED", "reason": "NOTIONAL_BELOW_MINIMUM"}
+
         # 4. Fat-Finger Price Collar Check
         if intent.mid_price > 0:
             price_dev = abs(intent.limit_price - intent.mid_price) / intent.mid_price
             if price_dev > self.max_fat_finger_pct:
                 return {"status": "REJECTED", "reason": "FAT_FINGER_PRICE_COLLAR"}
 
-        notional_usd = self.equity * alloc_frac
         qty_btc = round(notional_usd / intent.limit_price, 4 if intent.limit_price < 10.0 else 3)
         latency_us = (time.perf_counter_ns() - t0_ns) / 1000.0
 
         if qty_btc * intent.limit_price < 5.0:
             # Scale to minimum $5 notional
             qty_btc = round(6.0 / intent.limit_price, 4 if intent.limit_price < 10.0 else 3)
+
+        # Enforce hard upper bound on single position notional
+        if qty_btc * intent.limit_price > max_single_notional:
+            qty_btc = round(max_single_notional / intent.limit_price, 4 if intent.limit_price < 10.0 else 3)
 
         eff_vol = max(intent.rolling_vol, 0.0022)
         if intent.side == 1:

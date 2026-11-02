@@ -233,6 +233,83 @@ class BinanceFuturesTestnetClient:
         async with session.delete(url, headers=headers) as resp:
             return await resp.json()
 
+    async def cancel_order(self, symbol: str, order_id: int) -> Dict[str, Any]:
+        """
+        Cancels a specific order via DELETE /fapi/v1/order.
+        """
+        if not self.is_time_synced:
+            await self.sync_server_time()
+
+        if not self.api_key or not self.api_secret:
+            raise ValueError("API credentials required for cancel_order.")
+
+        params = self._sign_payload({
+            "symbol": symbol.upper(),
+            "orderId": int(order_id)
+        })
+        session = await self._get_session()
+        url = f"{self.base_url}/fapi/v1/order?{urlencode(params)}"
+        headers = self._get_headers()
+
+        async with session.delete(url, headers=headers) as resp:
+            return await resp.json()
+
+    async def set_leverage(self, symbol: str, leverage: int = 2) -> Dict[str, Any]:
+        """
+        Adjusts initial leverage for a symbol via POST /fapi/v1/leverage.
+        """
+        if not self.is_time_synced:
+            await self.sync_server_time()
+
+        if not self.api_key or not self.api_secret:
+            raise ValueError("API credentials required for set_leverage.")
+
+        params = self._sign_payload({
+            "symbol": symbol.upper(),
+            "leverage": int(leverage)
+        })
+        session = await self._get_session()
+        url = f"{self.base_url}/fapi/v1/leverage?{urlencode(params)}"
+        headers = self._get_headers()
+
+        async with session.post(url, headers=headers) as resp:
+            data = await resp.json()
+            logger.info("Set leverage %s to %sx: %s", symbol, leverage, data)
+            return data
+
+    async def set_margin_type(self, symbol: str, margin_type: str = "ISOLATED") -> Dict[str, Any]:
+        """
+        Changes margin type to ISOLATED or CROSSED via POST /fapi/v1/marginType.
+        Catches and ignores error code -4046 ("No need to change margin type.").
+        """
+        if not self.is_time_synced:
+            await self.sync_server_time()
+
+        if not self.api_key or not self.api_secret:
+            raise ValueError("API credentials required for set_margin_type.")
+
+        m_type = margin_type.upper()
+        if m_type not in ("ISOLATED", "CROSSED"):
+            m_type = "ISOLATED"
+
+        params = self._sign_payload({
+            "symbol": symbol.upper(),
+            "marginType": m_type
+        })
+        session = await self._get_session()
+        url = f"{self.base_url}/fapi/v1/marginType?{urlencode(params)}"
+        headers = self._get_headers()
+
+        async with session.post(url, headers=headers) as resp:
+            data = await resp.json()
+            if isinstance(data, dict):
+                # -4046: already target margin type
+                # -4048: margin type cannot be changed if there exists position
+                if data.get("code") in (-4046, -4048):
+                    return {"code": 200, "msg": data.get("msg"), "symbol": symbol.upper(), "raw": data}
+            logger.info("Set margin type %s to %s: %s", symbol, m_type, data)
+            return data
+
     async def get_position_risk(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Fetches current position risk and unrealized PnL via GET /fapi/v2/positionRisk.

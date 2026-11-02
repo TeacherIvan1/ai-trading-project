@@ -389,6 +389,7 @@ async def get_state(symbol: str = "BTCUSDT"):
     active_in_position_symbols = set()
 
     # (a) Live Testnet Positions (unrealized PnL from Binance fapi/v2/positionRisk)
+    total_unrealized_pnl = 0.0
     for p in live_testnet_positions:
         p_sym = p.get("symbol", "")
         p_amt = float(p.get("positionAmt", 0))
@@ -396,8 +397,13 @@ async def get_state(symbol: str = "BTCUSDT"):
             active_in_position_symbols.add(p_sym)
             entry_p = float(p.get("entryPrice", 0.0))
             unreal_pnl = float(p.get("unRealizedProfit", 0.0))
+            total_unrealized_pnl += unreal_pnl
             notional = abs(p_amt) * entry_p
             ret_bps = round((unreal_pnl / notional) * 10000, 1) if notional > 0 else 0.0
+
+            lev = int(p.get("leverage", 2))
+            is_iso = bool(p.get("isolated") or str(p.get("marginType", "")).lower() == "isolated")
+            m_type_str = "ISOLATED" if is_iso else "CROSS"
 
             executed_trades_list.append({
                 "symbol": p_sym,
@@ -405,11 +411,15 @@ async def get_state(symbol: str = "BTCUSDT"):
                 "entry_price": entry_p,
                 "exit_price": 0.0,
                 "pnl_usd": round(unreal_pnl, 2),
+                "unrealized_pnl": round(unreal_pnl, 2),
                 "net_return_bps": ret_bps,
                 "exit_reason": "TESTNET_LIVE_POSITION",
                 "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
                 "status": "OPEN",
                 "qty": abs(p_amt),
+                "leverage": lev,
+                "margin_type": m_type_str,
+                "leverage_badge": f"{lev}x [{m_type_str}]",
             })
 
     # (b) Open Shadow positions that have not been closed yet
@@ -426,11 +436,15 @@ async def get_state(symbol: str = "BTCUSDT"):
                 "entry_price": entry_p,
                 "exit_price": 0.0,
                 "pnl_usd": 0.0,
+                "unrealized_pnl": 0.0,
                 "net_return_bps": 0.0,
                 "exit_reason": o.get("trigger_reason", "SHADOW_ORDER_OPEN"),
                 "timestamp": (o.get("ts_utc") or "")[11:19] or "--:--:--",
                 "status": "OPEN",
                 "qty": float(o.get("qty", 0.0)),
+                "leverage": 2,
+                "margin_type": "ISOLATED",
+                "leverage_badge": "2x [ISOLATED]",
             })
 
     # (c) Closed Trades
@@ -443,11 +457,15 @@ async def get_state(symbol: str = "BTCUSDT"):
             "entry_price": entry_p,
             "exit_price": exit_p,
             "pnl_usd": round(float(t.get("pnl_usd", 0.0)), 2),
+            "unrealized_pnl": 0.0,
             "net_return_bps": round(float(t.get("net_return_bps", 0.0)), 1),
             "exit_reason": t.get("exit_reason", "HORIZONTAL_BARRIER"),
             "timestamp": (t.get("ts_utc") or "")[11:19] or "--:--:--",
             "status": "CLOSED",
             "qty": float(t.get("qty_btc", 0.0)),
+            "leverage": 2,
+            "margin_type": "ISOLATED",
+            "leverage_badge": "2x [ISOLATED]",
         })
 
     # 3. Active Cryptos (All 10 Universe Symbols Guaranteed)
@@ -527,11 +545,17 @@ async def get_state(symbol: str = "BTCUSDT"):
         win_rate = 0.0
         max_dd = 0.0
 
+    total_net_pnl = realized_pnl + total_unrealized_pnl
+
     account_metrics = {
         "testnet_equity": bal["total_balance"],
         "testnet_available": bal["available_balance"],
         "paper_equity": round(paper_equity, 2),
         "realized_pnl": round(realized_pnl, 2),
+        "unrealized_pnl": round(total_unrealized_pnl, 2),
+        "floating_pnl": round(total_unrealized_pnl, 2),
+        "total_unrealized_pnl": round(total_unrealized_pnl, 2),
+        "total_net_pnl": round(total_net_pnl, 2),
         "net_profit_usd": round(realized_pnl, 2),
         "net_profit_pct": round((realized_pnl / initial_paper_equity) * 100.0, 2),
         "win_rate": win_rate,
@@ -567,6 +591,10 @@ async def get_state(symbol: str = "BTCUSDT"):
         "symbol": target_symbol,
         "test_duration_seconds": duration_sec,
         "test_duration_formatted": duration_fmt,
+        "realized_pnl": round(realized_pnl, 2),
+        "unrealized_pnl": round(total_unrealized_pnl, 2),
+        "floating_pnl": round(total_unrealized_pnl, 2),
+        "total_net_pnl": round(total_net_pnl, 2),
         "net_profit_usd": round(realized_pnl, 2),
         "net_profit_pct": round((realized_pnl / initial_paper_equity) * 100.0, 2),
         "active_cryptos": active_cryptos,
@@ -678,27 +706,30 @@ async def get_dashboard():
     <!-- Top 2 Summary Cards: Profit & Duration -->
     <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
       
-      <!-- Card 1: Total Profit Earned & Sparkline -->
+      <!-- Card 1: Total Net PnL, Realized vs Floating Drawdown & Sparkline -->
       <div class="bg-brand-900 border border-brand-700/60 rounded-lg p-4 shadow flex flex-col justify-between">
         <div class="flex items-center justify-between mb-2">
-          <span class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Total Profit Earned</span>
-          <span class="text-[10px] text-slate-500">Starting Equity: $2,500.00</span>
+          <span class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Total Net PnL (Realized + Floating)</span>
+          <span class="text-[10px] text-slate-500">Testnet Equity: <span id="m1-equity-val" class="font-mono text-cyan-300 font-bold">$13,316.16</span></span>
         </div>
         <div class="flex items-baseline justify-between">
           <div>
-            <div id="m1-profit-usd" class="text-2xl font-black text-emerald-400 font-mono glow-bull">+$0.00</div>
-            <div id="m1-profit-pct" class="text-xs font-semibold text-emerald-400/80 font-mono">+0.00% Net Return</div>
+            <div id="m1-total-net-pnl" class="text-2xl font-black text-emerald-400 font-mono glow-bull">+$0.00</div>
+            <div class="flex items-center gap-3 mt-1.5 text-xs font-mono">
+              <span class="text-slate-400">Realized: <span id="m1-realized-pnl" class="font-bold text-slate-200">+$0.00</span></span>
+              <span class="text-slate-400">Floating: <span id="m1-floating-pnl" class="font-bold text-amber-300">+$0.00</span></span>
+            </div>
           </div>
           <!-- Sparkline Container -->
-          <div class="w-48 h-12 flex items-center justify-end">
+          <div class="w-44 h-12 flex items-center justify-end">
             <svg id="m1-sparkline-svg" class="w-full h-full overflow-visible" viewBox="0 0 180 40">
               <polyline id="m1-sparkline-poly" fill="none" stroke="#10b981" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" points="0,20 180,20" />
             </svg>
           </div>
         </div>
         <div class="mt-3 pt-2 border-t border-brand-800 text-[10px] text-slate-400 flex justify-between">
-          <span>Closed-Loop Paper Execution</span>
-          <span>Triple-Barrier Enforced</span>
+          <span>Real-Time Mark-to-Market</span>
+          <span>Max 10% Single / 40% Portfolio Notional</span>
         </div>
       </div>
 
@@ -1254,18 +1285,47 @@ async def get_dashboard():
           hdrEq.textContent = '$' + Number(state.account_metrics.testnet_available || state.account_metrics.testnet_equity || 0).toLocaleString('en-US', { minimumFractionDigits: 2 });
         }
 
-        // 2. Mode 1 KPI Pillars
-        const netPnl = Number(state.net_profit_usd ?? 0);
+        // 2. Mode 1 KPI Pillars (Realized, Floating & Total Net PnL)
+        const realizedPnl = Number(state.realized_pnl ?? state.account_metrics?.realized_pnl ?? 0);
+        const floatingPnl = Number(state.floating_pnl ?? state.account_metrics?.floating_pnl ?? 0);
+        const totalNetPnl = Number(state.total_net_pnl ?? (realizedPnl + floatingPnl));
+
+        const totPnlEl = document.getElementById('m1-total-net-pnl');
+        const realPnlEl = document.getElementById('m1-realized-pnl');
+        const floatPnlEl = document.getElementById('m1-floating-pnl');
+        const eqValEl = document.getElementById('m1-equity-val');
+
+        if (totPnlEl) {
+          const sign = totalNetPnl >= 0 ? '+' : '';
+          totPnlEl.textContent = `${sign}$${totalNetPnl.toFixed(2)}`;
+          totPnlEl.className = totalNetPnl >= 0 ? 'text-2xl font-black text-emerald-400 font-mono glow-bull' : 'text-2xl font-black text-rose-400 font-mono glow-bear';
+        }
+        if (realPnlEl) {
+          const sign = realizedPnl >= 0 ? '+' : '';
+          realPnlEl.textContent = `${sign}$${realizedPnl.toFixed(2)}`;
+          realPnlEl.className = realizedPnl >= 0 ? 'font-bold text-emerald-400' : 'font-bold text-rose-400';
+        }
+        if (floatPnlEl) {
+          const sign = floatingPnl >= 0 ? '+' : '';
+          floatPnlEl.textContent = `${sign}$${floatingPnl.toFixed(2)}`;
+          floatPnlEl.className = floatingPnl >= 0 ? 'font-bold text-emerald-400' : 'font-bold text-rose-400';
+        }
+        if (eqValEl && state.account_metrics) {
+          eqValEl.textContent = '$' + Number(state.account_metrics.testnet_equity || 0).toLocaleString('en-US', { minimumFractionDigits: 2 });
+        }
+
+        // Keep legacy profit-usd if present
         const pnlEl = document.getElementById('m1-profit-usd');
         const pnlPctEl = document.getElementById('m1-profit-pct');
-        const sign = netPnl >= 0 ? '+' : '';
         if (pnlEl) {
-          pnlEl.textContent = `${sign}$${netPnl.toFixed(2)}`;
-          pnlEl.className = netPnl >= 0 ? 'text-2xl font-black text-emerald-400 font-mono glow-bull' : 'text-2xl font-black text-rose-400 font-mono glow-bear';
+          const sign = totalNetPnl >= 0 ? '+' : '';
+          pnlEl.textContent = `${sign}$${totalNetPnl.toFixed(2)}`;
+          pnlEl.className = totalNetPnl >= 0 ? 'text-2xl font-black text-emerald-400 font-mono glow-bull' : 'text-2xl font-black text-rose-400 font-mono glow-bear';
         }
         if (pnlPctEl) {
+          const sign = totalNetPnl >= 0 ? '+' : '';
           pnlPctEl.textContent = `${sign}${Number(state.net_profit_pct ?? 0).toFixed(2)}% Net Return`;
-          pnlPctEl.className = netPnl >= 0 ? 'text-xs font-semibold text-emerald-400/80 font-mono' : 'text-xs font-semibold text-rose-400/80 font-mono';
+          pnlPctEl.className = totalNetPnl >= 0 ? 'text-xs font-semibold text-emerald-400/80 font-mono' : 'text-xs font-semibold text-rose-400/80 font-mono';
         }
 
         updateSparkline(state.equity_curve);
@@ -1344,7 +1404,10 @@ async def get_dashboard():
                   <td class="py-1 px-2 font-bold text-slate-200">${t.symbol || '--'}</td>
                   <td class="py-1 px-2"><span class="px-1.5 py-0.2 rounded text-[9px] font-bold ${statusClass}">${statusStr}</span></td>
                   <td class="py-1 px-2 ${sideClass}">${sideStr}</td>
-                  <td class="py-1 px-2 text-slate-300">$${entryP.toFixed(pDec)}</td>
+                  <td class="py-1 px-2 text-slate-300">
+                    <span>$${entryP.toFixed(pDec)}</span>
+                    <span class="ml-1.5 px-1 py-0.2 rounded text-[9px] font-bold bg-amber-500/10 text-amber-300 border border-amber-500/30 whitespace-nowrap">${t.leverage || 2}x [${t.margin_type || 'ISOLATED'}]</span>
+                  </td>
                   <td class="py-1 px-2 text-slate-300">${statusStr === 'OPEN' ? '--' : '$' + exitP.toFixed(pDec)}</td>
                   <td class="py-1 px-2 font-bold ${pnlClass}">${statusStr === 'OPEN' ? (pnlVal !== 0 ? (pnlVal >= 0 ? '+' : '') + '$' + pnlVal.toFixed(2) : '--') : (pnlVal >= 0 ? '+' : '') + '$' + pnlVal.toFixed(2)}</td>
                   <td class="py-1 px-2 text-slate-400 text-[10px]">${t.exit_reason || t.trigger_reason || '--'}</td>
