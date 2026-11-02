@@ -70,6 +70,7 @@ REF_PRICES = {
 # Process Manager state
 bot_process: Optional[subprocess.Popen] = None
 bot_start_time: Optional[float] = None
+desired_state: str = "RUNNING"
 
 # Global Testnet client and balance cache (TTL = 5 seconds)
 testnet_client = BinanceFuturesTestnetClient()
@@ -91,15 +92,48 @@ daemon_status_cache: Dict[str, Any] = {
 
 
 def get_daemon_status() -> Dict[str, Any]:
-    """Checks whether main_shadow_trial.py is currently running with low-latency caching."""
-    global bot_process
-    if bot_process is not None and bot_process.poll() is None:
-        return {"running": True, "pid": bot_process.pid}
+    """Checks whether main_shadow_trial.py is currently running using psutil + bot_process."""
+    global bot_process, bot_start_time
 
+    # 1. In-memory tracked child process
+    if bot_process is not None:
+        if bot_process.poll() is None:
+            if bot_start_time is None:
+                bot_start_time = time.time()
+            return {"running": True, "pid": bot_process.pid}
+        else:
+            bot_process = None
+
+    # 2. Fast scan via psutil for any running main_shadow_trial.py
+    try:
+        import psutil
+        for p in psutil.process_iter(["pid", "name", "cmdline", "create_time"]):
+            try:
+                p_name = (p.info.get("name") or "").lower()
+                if "python" not in p_name:
+                    continue
+                cmd = p.info.get("cmdline") or []
+                cmd_str = " ".join(cmd)
+                if "main_shadow_trial.py" in cmd_str and p.info.get("pid") != os.getpid():
+                    pid = p.info["pid"]
+                    if bot_start_time is None:
+                        create_t = p.info.get("create_time")
+                        bot_start_time = create_t if create_t else time.time()
+                    status = {"running": True, "pid": pid}
+                    daemon_status_cache["status"] = status
+                    daemon_status_cache["last_check"] = time.time()
+                    return status
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+    except Exception:
+        pass
+
+    # 3. Low-latency caching check
     now = time.time()
-    if now - daemon_status_cache["last_check"] < 3.0:
+    if now - daemon_status_cache["last_check"] < 2.0:
         return daemon_status_cache["status"]
 
+    # 4. Fallback to PowerShell CIM query
     try:
         cmd = [
             "powershell",
@@ -107,10 +141,12 @@ def get_daemon_status() -> Dict[str, Any]:
             "-Command",
             "Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" | Where-Object { $_.CommandLine -like '*main_shadow_trial.py*' } | Select-Object -ExpandProperty ProcessId"
         ]
-        out = subprocess.check_output(cmd, text=True, timeout=3.5).strip()
+        out = subprocess.check_output(cmd, text=True, timeout=3.0).strip()
         if out:
             pids = [int(p) for p in out.splitlines() if p.strip().isdigit()]
             if pids:
+                if bot_start_time is None:
+                    bot_start_time = time.time()
                 status = {"running": True, "pid": pids[0]}
                 daemon_status_cache["status"] = status
                 daemon_status_cache["last_check"] = now
@@ -118,6 +154,7 @@ def get_daemon_status() -> Dict[str, Any]:
     except Exception:
         pass
 
+    bot_start_time = None
     status = {"running": False, "pid": None}
     daemon_status_cache["status"] = status
     daemon_status_cache["last_check"] = now
@@ -285,8 +322,9 @@ def parse_tail_dollar_bars(max_bars: int = 60, target_symbol: str = "BTCUSDT") -
 
 @app.post("/api/bot/start")
 async def start_bot():
-    """Starts main_shadow_trial.py with --testnet in the background."""
-    global bot_process, bot_start_time
+    """Starts main_shadow_trial.py with --testnet in the background and sets desired_state=RUNNING."""
+    global bot_process, bot_start_time, desired_state
+    desired_state = "RUNNING"
     status = get_daemon_status()
     if status["running"]:
         if bot_start_time is None:
@@ -312,8 +350,9 @@ async def start_bot():
 
 @app.post("/api/bot/stop")
 async def stop_bot():
-    """Stops main_shadow_trial.py, cancels open testnet orders, and records stop."""
-    global bot_process, bot_start_time
+    """Stops main_shadow_trial.py, cancels open testnet orders, and sets desired_state=STOPPED."""
+    global bot_process, bot_start_time, desired_state
+    desired_state = "STOPPED"
     status = get_daemon_status()
     killed = False
 
@@ -342,6 +381,25 @@ async def stop_bot():
     return JSONResponse({"status": "stopped", "message": "Bot process terminated and open orders cancelled"})
 
 
+async def bot_watchdog_loop():
+    """Background watchdog: checks every 30 seconds; if desired_state == 'RUNNING' and bot not running, auto-restarts."""
+    while True:
+        await asyncio.sleep(30.0)
+        try:
+            if desired_state == "RUNNING":
+                status = get_daemon_status()
+                if not status["running"]:
+                    print("[WATCHDOG] main_shadow_trial.py not running (desired_state=RUNNING). Auto-restarting...", flush=True)
+                    await start_bot()
+        except Exception as e:
+            print(f"[WATCHDOG ERROR] {e}", flush=True)
+
+
+@app.on_event("startup")
+async def on_startup():
+    asyncio.create_task(bot_watchdog_loop())
+
+
 @app.get("/api/state")
 async def get_state(symbol: str = "BTCUSDT"):
     """
@@ -362,21 +420,22 @@ async def get_state(symbol: str = "BTCUSDT"):
 
     bot_running = daemon_info["running"]
 
-    # 1. Strictly compute elapsed session time from BOT_SESSION_STARTED
+    # 1. Strictly compute elapsed session time from bot_start_time / BOT_SESSION_STARTED
     duration_sec = 0
     duration_fmt = "00:00:00"
     if bot_running:
-        session_event = audit_data["session_started"]
-        if session_event:
-            ts_str = session_event.get("ts_utc") or session_event.get("timestamp")
-            if ts_str:
-                try:
-                    start_dt = datetime.fromisoformat(ts_str)
-                    duration_sec = max(0, int((datetime.now(timezone.utc) - start_dt).total_seconds()))
-                except Exception:
-                    duration_sec = int(time.time() - bot_start_time) if bot_start_time else 0
-        elif bot_start_time:
+        if bot_start_time:
             duration_sec = max(0, int(time.time() - bot_start_time))
+        else:
+            session_event = audit_data["session_started"]
+            if session_event:
+                ts_str = session_event.get("ts_utc") or session_event.get("timestamp")
+                if ts_str:
+                    try:
+                        start_dt = datetime.fromisoformat(ts_str)
+                        duration_sec = max(0, int((datetime.now(timezone.utc) - start_dt).total_seconds()))
+                    except Exception:
+                        duration_sec = 0
         
         hrs, rem = divmod(duration_sec, 3600)
         mins, secs = divmod(rem, 60)
@@ -424,9 +483,12 @@ async def get_state(symbol: str = "BTCUSDT"):
 
     # (b) Open Shadow positions that have not been closed yet
     closed_ids = {t.get("cl_ord_id") for t in audit_data["closed_trades"]}
+    live_testnet_symbols = {p.get("symbol") for p in live_testnet_positions} if live_testnet_positions else set()
     for o in reversed(audit_data["opened_positions"]):
         cl_id = o.get("cl_ord_id")
         o_sym = o.get("symbol", "BTCUSDT")
+        if live_testnet_symbols and o_sym not in live_testnet_symbols:
+            continue
         if cl_id and cl_id not in closed_ids and o_sym not in active_in_position_symbols:
             active_in_position_symbols.add(o_sym)
             entry_p = float(o.get("entry_price", o.get("price", 0.0)))

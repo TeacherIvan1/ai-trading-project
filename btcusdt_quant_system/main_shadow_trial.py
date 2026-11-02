@@ -140,6 +140,7 @@ class LiveShadowTrialRunner:
         )
         self.risk_engines = {s: self.risk_engine for s in self.symbols}
         self.order_routing_lock = asyncio.Lock()
+        self.open_positions: Dict[str, dict] = {}
 
         # Setup logs
         self.logs_dir = PROJECT_ROOT / "logs"
@@ -278,6 +279,62 @@ class LiveShadowTrialRunner:
                 return json.loads(resp.read().decode("utf-8"))
         return await asyncio.to_thread(_get)
 
+    async def sync_live_exchange_positions(self) -> Dict[str, dict]:
+        """
+        Queries /fapi/v2/positionRisk and syncs live positions into self.open_positions
+        and self.risk_engine.active_positions.
+        """
+        if not self.testnet_client:
+            return {}
+        try:
+            positions = await self.testnet_client.get_position_risk()
+            live_pos = {}
+            for p in positions:
+                amt = float(p.get("positionAmt", 0.0))
+                sym = p.get("symbol")
+                if abs(amt) > 0 and sym in self.symbols:
+                    entry_p = float(p.get("entryPrice", 0.0))
+                    pos_side = 1 if amt > 0 else -1
+                    live_pos[sym] = {
+                        "symbol": sym,
+                        "amt": amt,
+                        "entry_price": entry_p,
+                        "side": pos_side,
+                        "leverage": p.get("leverage"),
+                        "isolated": p.get("isolated")
+                    }
+                    if sym not in self.risk_engine.active_positions:
+                        eff_vol = 0.005
+                        pt_p = entry_p * (1.0 + 1.5 * eff_vol) if pos_side == 1 else entry_p * (1.0 - 1.5 * eff_vol)
+                        sl_p = entry_p * (1.0 - 1.5 * eff_vol) if pos_side == 1 else entry_p * (1.0 + 1.5 * eff_vol)
+                        self.risk_engine.active_positions[sym] = ActivePaperPosition(
+                            cl_ord_id=f"TESTNET_SYNCED_{sym}",
+                            symbol=sym,
+                            side=pos_side,
+                            entry_price=entry_p,
+                            arrival_mid=entry_p,
+                            qty_btc=abs(amt),
+                            notional_usd=abs(amt) * entry_p,
+                            entry_bar_idx=0,
+                            pt_price=pt_p,
+                            sl_price=sl_p,
+                            stall_bar_idx=10,
+                            stall_min_ret=0.001,
+                            max_bar_idx=40,
+                            meta_prob=0.70,
+                            entry_ts_ms=int(time.time() * 1000)
+                        )
+            # Remove any positions in risk_engine that are no longer active on exchange
+            for sym in list(self.risk_engine.active_positions.keys()):
+                if sym not in live_pos:
+                    self.risk_engine.active_positions.pop(sym, None)
+
+            self.open_positions = live_pos
+            return live_pos
+        except Exception as e:
+            print(f"[EXCHANGE POS SYNC ERROR] {e}", flush=True)
+            return self.open_positions
+
     async def _cancel_quotes_callback(self, symbol: str) -> None:
         now_iso = datetime.now(timezone.utc).isoformat()
         if self.testnet_client:
@@ -364,11 +421,15 @@ class LiveShadowTrialRunner:
             order_status = "NO_PRIMARY_BREAKOUT"
             if ign_trigger or ta_trigger:
                 async with self.order_routing_lock:
-                    active_position_count = len(self.risk_engine.active_positions)
-                    max_concurrent_positions = 4
-                    if active_position_count >= max_concurrent_positions:
+                    # Enforce a hard exchange-verified check before placing any entry order
+                    if self.testnet_client:
+                        live_pos = await self.sync_live_exchange_positions()
+                    else:
+                        live_pos = self.risk_engine.active_positions
+
+                    if len(live_pos) >= 4:
                         order_status = "FILTERED_MAX_CONCURRENT_POSITIONS_REACHED"
-                    elif symbol in self.risk_engine.active_positions:
+                    elif symbol in live_pos:
                         order_status = f"SKIPPED_POSITION_ALREADY_OPEN_FOR_{symbol}"
                     else:
                         target_side = primary_side if ign_trigger else (1 if deliberation.proposal.action == "BUY" else -1)
@@ -487,9 +548,6 @@ class LiveShadowTrialRunner:
                             order_status = f"FILTERED_{decision.get('reason', 'BY_RISK_ENGINE')}"
                         else:
                             order_status = f"{decision.get('status')}_{decision.get('reason', '')}"
-                    order_status = f"FILTERED_{decision.get('reason', 'BY_RISK_ENGINE')}"
-                else:
-                    order_status = f"{decision.get('status')}_{decision.get('reason', '')}"
 
         except Exception as err:
             close_price = float(new_bar.get("close", 0.0))
@@ -515,6 +573,8 @@ class LiveShadowTrialRunner:
 
     async def trigger_initial_evaluations(self):
         """Evaluates all 10 warmed-up symbols immediately so qualifying signals execute on startup."""
+        if self.testnet_client:
+            await self.sync_live_exchange_positions()
         print(f"[STARTUP] Triggering initial evaluation across 10 warmed-up symbols...", flush=True)
         for s in self.symbols:
             try:
@@ -605,36 +665,9 @@ class LiveShadowTrialRunner:
                 except Exception as me:
                     print(f"[TESTNET INIT] Margin/leverage warning on {s}: {me}", flush=True)
 
-            # Sync active positions from exchange into risk engine
-            try:
-                pos_list = await self.testnet_client.get_position_risk()
-                for p in pos_list:
-                    amt = float(p.get("positionAmt", 0.0))
-                    sym = p.get("symbol")
-                    if abs(amt) > 0 and sym in self.symbols:
-                        entry_p = float(p.get("entryPrice", 0.0))
-                        pos_side = 1 if amt > 0 else -1
-                        eff_vol = 0.005
-                        pt_p = entry_p * (1.0 + 1.5 * eff_vol) if pos_side == 1 else entry_p * (1.0 - 1.5 * eff_vol)
-                        sl_p = entry_p * (1.0 - 1.5 * eff_vol) if pos_side == 1 else entry_p * (1.0 + 1.5 * eff_vol)
-                        self.risk_engine.active_positions[sym] = ActivePaperPosition(
-                            cl_ord_id=f"TESTNET_RECONNECTED_{sym}",
-                            symbol=sym,
-                            side=pos_side,
-                            entry_price=entry_p,
-                            arrival_mid=entry_p,
-                            qty_btc=abs(amt),
-                            notional_usd=abs(amt) * entry_p,
-                            entry_bar_idx=0,
-                            pt_price=pt_p,
-                            sl_price=sl_p,
-                            entry_ts_ns=time.time_ns(),
-                            meta_prob=0.70,
-                            vpin_at_entry=0.50
-                        )
-                print(f"[TESTNET INIT] Synced {len(self.risk_engine.active_positions)} active exchange positions into risk engine: {list(self.risk_engine.active_positions.keys())}", flush=True)
-            except Exception as pe:
-                print(f"[TESTNET INIT] Position sync warning: {pe}", flush=True)
+            # Sync live exchange positions into risk engine and self.open_positions
+            live_pos = await self.sync_live_exchange_positions()
+            print(f"[TESTNET INIT] Synced {len(live_pos)} active exchange positions: {list(live_pos.keys())}", flush=True)
 
         reconnect_delay = 1.0
         while True:
