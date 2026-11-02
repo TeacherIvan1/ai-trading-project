@@ -84,8 +84,22 @@ positions_cache: Dict[str, Any] = {
 }
 
 
+daemon_status_cache: Dict[str, Any] = {
+    "last_check": 0.0,
+    "status": {"running": False, "pid": None}
+}
+
+
 def get_daemon_status() -> Dict[str, Any]:
-    """Checks whether main_shadow_trial.py is currently running."""
+    """Checks whether main_shadow_trial.py is currently running with low-latency caching."""
+    global bot_process
+    if bot_process is not None and bot_process.poll() is None:
+        return {"running": True, "pid": bot_process.pid}
+
+    now = time.time()
+    if now - daemon_status_cache["last_check"] < 3.0:
+        return daemon_status_cache["status"]
+
     try:
         cmd = [
             "powershell",
@@ -93,14 +107,21 @@ def get_daemon_status() -> Dict[str, Any]:
             "-Command",
             "Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" | Where-Object { $_.CommandLine -like '*main_shadow_trial.py*' } | Select-Object -ExpandProperty ProcessId"
         ]
-        out = subprocess.check_output(cmd, text=True, timeout=2.5).strip()
+        out = subprocess.check_output(cmd, text=True, timeout=3.5).strip()
         if out:
             pids = [int(p) for p in out.splitlines() if p.strip().isdigit()]
             if pids:
-                return {"running": True, "pid": pids[0]}
+                status = {"running": True, "pid": pids[0]}
+                daemon_status_cache["status"] = status
+                daemon_status_cache["last_check"] = now
+                return status
     except Exception:
         pass
-    return {"running": False, "pid": None}
+
+    status = {"running": False, "pid": None}
+    daemon_status_cache["status"] = status
+    daemon_status_cache["last_check"] = now
+    return status
 
 
 async def get_cached_testnet_balance() -> Dict[str, float]:
@@ -229,7 +250,7 @@ def parse_tail_dollar_bars(max_bars: int = 60, target_symbol: str = "BTCUSDT") -
             last_time = 0
             for r in matching[-max_bars:]:
                 try:
-                    close_ts = int(r["close_ts"])
+                    close_ts = int(float(r["close_ts"]))
                     t_sec = int(close_ts / 1000)
                     if t_sec <= last_time:
                         t_sec = last_time + 1
@@ -252,7 +273,7 @@ def parse_tail_dollar_bars(max_bars: int = 60, target_symbol: str = "BTCUSDT") -
                         "close": c,
                         "dollar_volume": float(r.get("dollar_volume", 0.0)),
                         "net_order_flow": float(r.get("net_order_flow", 0.0)),
-                        "ticks": int(r.get("ticks", 0)),
+                        "ticks": int(float(r.get("ticks", 0))),
                         "symbol": r.get("symbol", target_symbol),
                     })
                 except Exception:
@@ -542,6 +563,8 @@ async def get_state(symbol: str = "BTCUSDT"):
 
     return {
         "bot_running": bot_running,
+        "target_symbol": target_symbol,
+        "symbol": target_symbol,
         "test_duration_seconds": duration_sec,
         "test_duration_formatted": duration_fmt,
         "net_profit_usd": round(realized_pnl, 2),
