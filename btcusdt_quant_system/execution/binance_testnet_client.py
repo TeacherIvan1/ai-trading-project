@@ -233,6 +233,58 @@ class BinanceFuturesTestnetClient:
         async with session.delete(url, headers=headers) as resp:
             return await resp.json()
 
+    async def get_position_risk(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Fetches current position risk and unrealized PnL via GET /fapi/v2/positionRisk.
+        """
+        if not self.is_time_synced:
+            await self.sync_server_time()
+
+        if not self.api_key or not self.api_secret:
+            return []
+
+        payload = {"symbol": symbol.upper()} if symbol else {}
+        params = self._sign_payload(payload)
+        session = await self._get_session()
+        url = f"{self.base_url}/fapi/v2/positionRisk?{urlencode(params)}"
+        headers = self._get_headers()
+
+        try:
+            async with session.get(url, headers=headers) as resp:
+                data = await resp.json()
+                if isinstance(data, list):
+                    return data
+                return []
+        except Exception as e:
+            logger.error("Error fetching positionRisk: %s", e)
+            return []
+
+    async def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Fetches currently active open orders via GET /fapi/v1/openOrders.
+        """
+        if not self.is_time_synced:
+            await self.sync_server_time()
+
+        if not self.api_key or not self.api_secret:
+            return []
+
+        payload = {"symbol": symbol.upper()} if symbol else {}
+        params = self._sign_payload(payload)
+        session = await self._get_session()
+        url = f"{self.base_url}/fapi/v1/openOrders?{urlencode(params)}"
+        headers = self._get_headers()
+
+        try:
+            async with session.get(url, headers=headers) as resp:
+                data = await resp.json()
+                if isinstance(data, list):
+                    return data
+                return []
+        except Exception as e:
+            logger.error("Error fetching openOrders: %s", e)
+            return []
+
     async def close(self) -> None:
         """Closes the underlying aiohttp ClientSession."""
         if self._owns_session and self._session and not self._session.closed:

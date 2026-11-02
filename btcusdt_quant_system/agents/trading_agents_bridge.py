@@ -312,3 +312,4 @@ class TauricTradingAgentsPipeline:
 
 # Singleton instance for system-wide access
 trading_agents_pipeline = TauricTradingAgentsPipeline()
+

@@ -184,6 +184,13 @@ class LiveShadowTrialRunner:
             self.bars_df[s] = df_warmup
             self.current_bar_idx[s] = len(df_warmup)
 
+            # Persist last 60 warmup bars per symbol so GET /api/state?symbol=... always returns 60+ bars immediately
+            try:
+                for _, r in df_warmup.tail(60).iterrows():
+                    self._record_live_dollar_bar_csv(s, r.to_dict())
+            except Exception:
+                pass
+
             # Pre-evaluate micro indicators & signals on isolated symbol data
             try:
                 df_micro = self.bar_engines[s].compute_vpin_and_kyle_lambda(df_warmup, window=50)

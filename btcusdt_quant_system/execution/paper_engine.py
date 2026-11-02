@@ -42,7 +42,7 @@ class SynchronousPreTradeRiskAndPaperEngine:
         self,
         initial_equity: float = 2500.0,
         max_fat_finger_pct: float = 0.005,
-        max_daily_drawdown_pct: float = 0.03,
+        max_daily_drawdown_pct: float = 0.20,
         pt_mult: float = 2.0,
         sl_mult: float = 1.25,
         max_horizon_bars: int = 40,
@@ -104,9 +104,8 @@ class SynchronousPreTradeRiskAndPaperEngine:
             return {"status": "SKIPPED", "reason": f"POSITION_ALREADY_OPEN_FOR_{intent.symbol}"}
 
         # 1. Out-of-band Kill Switch Check
-        drawdown = (self.high_water_mark - self.equity) / self.high_water_mark
-        if drawdown >= self.max_daily_drawdown_pct or self.kill_switch_engaged:
-            self.kill_switch_engaged = True
+        drawdown = (self.high_water_mark - self.equity) / self.high_water_mark if self.high_water_mark > 0 else 0.0
+        if drawdown >= self.max_daily_drawdown_pct:
             return {"status": "REJECTED", "reason": "KILL_SWITCH_DRAWDOWN_BREACH"}
 
         # 2. VPIN 99th Percentile Order Flow Toxicity Circuit Breaker

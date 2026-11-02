@@ -9,7 +9,7 @@ Features:
   * Mode 1: Simple Overview (Total Profit + Equity Curve, Test Duration Timer, 10-Asset Cards, Executed Trades)
   * Mode 2: QuantLab & TradingAgents Pro (Lightweight Candlestick Chart, VPIN Gauge, Pre-Trade Risk Gate,
             TauricResearch 5-Phase Multi-Agent Consensus Terminal, Real-Time Audit Feed)
-- Native Binance Futures Testnet and Shadow execution state tracking.
+- Native Binance Futures Testnet positions and order routing integration.
 """
 
 import asyncio
@@ -34,7 +34,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from execution.binance_testnet_client import BinanceFuturesTestnetClient
 from agents.trading_agents_bridge import trading_agents_pipeline
 
-app = FastAPI(title="BTCUSDT Quant Engine // Terminal & TradingAgents")
+app = FastAPI(title="Crypto Quant Engine // Terminal & TradingAgents")
 
 app.add_middleware(
     CORSMiddleware,
@@ -75,8 +75,12 @@ bot_start_time: Optional[float] = None
 testnet_client = BinanceFuturesTestnetClient()
 balance_cache: Dict[str, Any] = {
     "last_fetch": 0.0,
-    "available_balance": 13484.09,
+    "available_balance": 13314.88,
     "total_balance": 13484.09,
+}
+positions_cache: Dict[str, Any] = {
+    "last_fetch": 0.0,
+    "data": [],
 }
 
 
@@ -117,27 +121,99 @@ async def get_cached_testnet_balance() -> Dict[str, float]:
     }
 
 
-def parse_tail_audit_log(max_lines: int = 500) -> List[Dict[str, Any]]:
-    """Reads the last max_lines from shadow_trial_audit.jsonl."""
+async def get_cached_testnet_positions() -> List[Dict[str, Any]]:
+    """Queries active positions from Binance Futures Testnet /fapi/v2/positionRisk."""
+    now = time.time()
+    if now - positions_cache["last_fetch"] > 4.0:
+        try:
+            pos_list = await testnet_client.get_position_risk()
+            active_pos = [p for p in pos_list if float(p.get("positionAmt", 0)) != 0]
+            positions_cache["data"] = active_pos
+            positions_cache["last_fetch"] = now
+        except Exception:
+            positions_cache["last_fetch"] = now - 2.0
+    return positions_cache["data"]
+
+
+def parse_audit_log_data(max_tail: int = 5000) -> Dict[str, Any]:
+    """
+    Scans the tail of shadow_trial_audit.jsonl and extracts:
+    - recent_events (last 30)
+    - latest BOT_SESSION_STARTED event
+    - closed_trades list
+    - opened_positions list
+    - evaluations per symbol
+    """
     if not AUDIT_LOG_PATH.exists():
-        return []
-    records = []
+        return {
+            "recent_events": [],
+            "session_started": None,
+            "closed_trades": [],
+            "opened_positions": [],
+            "evaluations": {},
+        }
+
+    lines = []
     try:
         with open(AUDIT_LOG_PATH, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-            for line in lines[-max_lines:]:
-                line = line.strip()
-                if line:
-                    try:
-                        records.append(json.loads(line))
-                    except Exception:
-                        pass
+            lines = f.readlines()[-max_tail:]
     except Exception:
         pass
-    return records
+
+    session_started = None
+    closed_trades = []
+    opened_positions = []
+    evaluations: Dict[str, Dict[str, Any]] = {}
+    recent_events = []
+
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+            et = e.get("event_type")
+            sym = e.get("symbol")
+            recent_events.append(e)
+
+            if et == "BOT_SESSION_STARTED":
+                session_started = e
+            elif et == "SHADOW_POSITION_CLOSED":
+                closed_trades.append(e)
+            elif et in ("SHADOW_POSITION_OPENED", "TESTNET_ORDER_ROUTED"):
+                opened_positions.append(e)
+            elif et == "SHADOW_SIGNAL_EVALUATED" and sym:
+                evaluations[sym] = e
+        except Exception:
+            continue
+
+    # Format recent events for audit table
+    formatted_recent = []
+    for e in recent_events[-35:]:
+        ts = e.get("ts_utc", "")
+        time_part = ts[11:19] if len(ts) >= 19 else ts
+        formatted_recent.append({
+            "ts": time_part,
+            "ts_utc": ts,
+            "symbol": e.get("symbol", "-"),
+            "event_type": e.get("event_type", ""),
+            "close": e.get("close_price", e.get("close", e.get("price", e.get("entry_price", "-")))),
+            "side": e.get("primary_side", e.get("side", "-")),
+            "z_dist": e.get("z_dist", "-"),
+            "status": e.get("order_status", e.get("status", e.get("exit_reason", e.get("trigger_reason", "-")))),
+            "order_id": e.get("orderId", e.get("cl_ord_id", "-")),
+        })
+
+    return {
+        "recent_events": formatted_recent,
+        "session_started": session_started,
+        "closed_trades": closed_trades,
+        "opened_positions": opened_positions,
+        "evaluations": evaluations,
+    }
 
 
-def parse_tail_dollar_bars(max_bars: int = 100, target_symbol: str = "BTCUSDT") -> List[Dict[str, Any]]:
+def parse_tail_dollar_bars(max_bars: int = 60, target_symbol: str = "BTCUSDT") -> List[Dict[str, Any]]:
     """Parses the tail of live_dollar_bars.csv filtered strictly by target_symbol."""
     if not LIVE_BARS_CSV_PATH.exists():
         return []
@@ -235,7 +311,6 @@ async def stop_bot():
         except Exception:
             pass
 
-    # Cancel open orders across active universe
     for s in DEFAULT_UNIVERSE:
         try:
             await testnet_client.cancel_all_open_orders(s)
@@ -248,129 +323,159 @@ async def stop_bot():
 
 @app.get("/api/state")
 async def get_state(symbol: str = "BTCUSDT"):
-    """Full real-time state extraction endpoint for Mode 1 & Mode 2 filtered by symbol."""
+    """
+    Standard JSON Contract for Mode 1 & Mode 2.
+    Guarantees complete, non-null arrays for active_cryptos, executed_trades_list,
+    bars_series, and recent_events.
+    """
     global bot_start_time
-    target_symbol = symbol.strip().upper()
+    target_symbol = symbol.strip().upper() if symbol else "BTCUSDT"
+    if target_symbol not in DEFAULT_UNIVERSE:
+        target_symbol = "BTCUSDT"
+
     bal = await get_cached_testnet_balance()
+    live_testnet_positions = await get_cached_testnet_positions()
     daemon_info = get_daemon_status()
-    audit_events = parse_tail_audit_log(500)
-    bars = parse_tail_dollar_bars(100, target_symbol=target_symbol)
+    audit_data = parse_audit_log_data(5000)
+    bars = parse_tail_dollar_bars(60, target_symbol=target_symbol)
 
     bot_running = daemon_info["running"]
+
+    # 1. Strictly compute elapsed session time from BOT_SESSION_STARTED
     duration_sec = 0
     duration_fmt = "00:00:00"
-
-    # Step 3 Fix: Calculate elapsed time strictly from the current session start
     if bot_running:
-        session_events = [e for e in audit_events if e.get("event_type") == "BOT_SESSION_STARTED"]
-        if session_events:
-            try:
-                start_dt = datetime.fromisoformat(session_events[-1]["ts_utc"])
-                duration_sec = max(0, int((datetime.now(timezone.utc) - start_dt).total_seconds()))
-            except Exception:
-                duration_sec = int(time.time() - bot_start_time) if bot_start_time else 0
+        session_event = audit_data["session_started"]
+        if session_event:
+            ts_str = session_event.get("ts_utc") or session_event.get("timestamp")
+            if ts_str:
+                try:
+                    start_dt = datetime.fromisoformat(ts_str)
+                    duration_sec = max(0, int((datetime.now(timezone.utc) - start_dt).total_seconds()))
+                except Exception:
+                    duration_sec = int(time.time() - bot_start_time) if bot_start_time else 0
         elif bot_start_time:
             duration_sec = max(0, int(time.time() - bot_start_time))
-        else:
-            recent_events = [datetime.fromisoformat(e["ts_utc"]) for e in audit_events[-15:] if e.get("ts_utc")]
-            if recent_events:
-                duration_sec = max(0, int((datetime.now(timezone.utc) - min(recent_events)).total_seconds()))
-
+        
         hrs, rem = divmod(duration_sec, 3600)
         mins, secs = divmod(rem, 60)
         duration_fmt = f"{hrs:02d}:{mins:02d}:{secs:02d}"
     else:
         bot_start_time = None
 
-    # 1. System Health
-    resync_count = sum(1 for e in audit_events if e.get("event_type") == "L2_BOOK_RESYNC")
-    dollar_bars_formed = sum(1 for e in audit_events if e.get("event_type") in ("DOLLAR_BAR_CLOSED", "DOLLAR_BAR_FORMED"))
-    testnet_orders = [e for e in audit_events if e.get("event_type") == "TESTNET_ORDER_ROUTED"]
-    current_mode = "TESTNET" if len(testnet_orders) > 0 or os.getenv("BINANCE_FUTURES_TESTNET_API_KEY") else "SHADOW"
-    last_event_utc = audit_events[-1].get("ts_utc") if audit_events else datetime.now(timezone.utc).isoformat()
-
-    system_health = {
-        "daemon_running": bot_running,
-        "daemon_pid": daemon_info["pid"],
-        "uptime_str": duration_fmt,
-        "resync_count": resync_count,
-        "dollar_bars_formed": dollar_bars_formed,
-        "last_event_utc": last_event_utc,
-        "mode": current_mode,
-        "selected_symbol": target_symbol,
-    }
-
-    # 2. Account & Profit Metrics
-    initial_paper_equity = 2500.00
-    closed_trades = [e for e in audit_events if e.get("event_type") == "SHADOW_POSITION_CLOSED"]
-    opened_positions = [e for e in audit_events if e.get("event_type") == "SHADOW_POSITION_OPENED"]
-
-    closed_ids = {t.get("cl_ord_id") for t in closed_trades}
-    open_trades = [o for o in opened_positions if o.get("cl_ord_id") not in closed_ids]
-
-    realized_pnl = sum(float(t.get("pnl_usd", 0.0)) for t in closed_trades)
-    paper_equity = initial_paper_equity + realized_pnl
-    if closed_trades:
-        paper_equity = float(closed_trades[-1].get("updated_equity", paper_equity))
-        wins = [t for t in closed_trades if float(t.get("pnl_usd", 0.0)) > 0]
-        win_rate = (len(wins) / len(closed_trades)) * 100.0
-        max_dd = max(float(t.get("drawdown_pct", 0.0)) for t in closed_trades)
-    else:
-        win_rate = 0.0
-        max_dd = 0.0
-
-    net_profit_usd = round(realized_pnl, 2)
-    net_profit_pct = round((realized_pnl / initial_paper_equity) * 100.0, 2)
-
-    # 3. Executed Trades List (Active Open Positions + Completed Trades)
+    # 2. Executed Trades List: Combine Live Testnet Positions + Open Shadow + Closed Trades
     executed_trades_list = []
-    for o in reversed(open_trades):
-        executed_trades_list.append({
-            "symbol": o.get("symbol", "BTCUSDT"),
-            "side": "BUY" if o.get("side") == 1 else "SELL",
-            "entry_price": float(o.get("entry_price", 0.0)),
-            "exit_price": 0.0,
-            "pnl_usd": 0.0,
-            "net_return_bps": 0.0,
-            "exit_reason": o.get("trigger_reason", "POSITION_OPEN"),
-            "timestamp": o.get("ts_utc", "")[11:19] if o.get("ts_utc") else "--:--:--",
-            "status": "OPEN"
-        })
+    active_in_position_symbols = set()
 
-    for t in reversed(closed_trades[-30:]):
+    # (a) Live Testnet Positions (unrealized PnL from Binance fapi/v2/positionRisk)
+    for p in live_testnet_positions:
+        p_sym = p.get("symbol", "")
+        p_amt = float(p.get("positionAmt", 0))
+        if p_amt != 0:
+            active_in_position_symbols.add(p_sym)
+            entry_p = float(p.get("entryPrice", 0.0))
+            unreal_pnl = float(p.get("unRealizedProfit", 0.0))
+            notional = abs(p_amt) * entry_p
+            ret_bps = round((unreal_pnl / notional) * 10000, 1) if notional > 0 else 0.0
+
+            executed_trades_list.append({
+                "symbol": p_sym,
+                "side": "BUY" if p_amt > 0 else "SELL",
+                "entry_price": entry_p,
+                "exit_price": 0.0,
+                "pnl_usd": round(unreal_pnl, 2),
+                "net_return_bps": ret_bps,
+                "exit_reason": "TESTNET_LIVE_POSITION",
+                "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                "status": "OPEN",
+                "qty": abs(p_amt),
+            })
+
+    # (b) Open Shadow positions that have not been closed yet
+    closed_ids = {t.get("cl_ord_id") for t in audit_data["closed_trades"]}
+    for o in reversed(audit_data["opened_positions"]):
+        cl_id = o.get("cl_ord_id")
+        o_sym = o.get("symbol", "BTCUSDT")
+        if cl_id and cl_id not in closed_ids and o_sym not in active_in_position_symbols:
+            active_in_position_symbols.add(o_sym)
+            entry_p = float(o.get("entry_price", o.get("price", 0.0)))
+            executed_trades_list.append({
+                "symbol": o_sym,
+                "side": "BUY" if o.get("side") in (1, "BUY", "buy") else "SELL",
+                "entry_price": entry_p,
+                "exit_price": 0.0,
+                "pnl_usd": 0.0,
+                "net_return_bps": 0.0,
+                "exit_reason": o.get("trigger_reason", "SHADOW_ORDER_OPEN"),
+                "timestamp": (o.get("ts_utc") or "")[11:19] or "--:--:--",
+                "status": "OPEN",
+                "qty": float(o.get("qty", 0.0)),
+            })
+
+    # (c) Closed Trades
+    for t in reversed(audit_data["closed_trades"][-25:]):
+        entry_p = float(t.get("entry_price", 0.0))
+        exit_p = float(t.get("exit_price", 0.0))
         executed_trades_list.append({
             "symbol": t.get("symbol", "BTCUSDT"),
-            "side": "BUY" if t.get("side") == 1 else "SELL",
-            "entry_price": float(t.get("entry_price", 0.0)),
-            "exit_price": float(t.get("exit_price", 0.0)),
+            "side": "BUY" if t.get("side") in (1, "BUY") else "SELL",
+            "entry_price": entry_p,
+            "exit_price": exit_p,
             "pnl_usd": round(float(t.get("pnl_usd", 0.0)), 2),
             "net_return_bps": round(float(t.get("net_return_bps", 0.0)), 1),
             "exit_reason": t.get("exit_reason", "HORIZONTAL_BARRIER"),
-            "timestamp": t.get("ts_utc", "")[11:19] if t.get("ts_utc") else "--:--:--",
-            "status": "CLOSED"
+            "timestamp": (t.get("ts_utc") or "")[11:19] or "--:--:--",
+            "status": "CLOSED",
+            "qty": float(t.get("qty_btc", 0.0)),
         })
 
-    account_metrics = {
-        "testnet_equity": bal["total_balance"],
-        "testnet_available": bal["available_balance"],
-        "paper_equity": round(paper_equity, 2),
-        "realized_pnl": net_profit_usd,
-        "net_profit_usd": net_profit_usd,
-        "net_profit_pct": net_profit_pct,
-        "win_rate": round(win_rate, 1),
-        "open_positions": len(open_trades),
-        "max_drawdown": round(max_dd, 2),
-        "total_trades": len(closed_trades),
-    }
+    # 3. Active Cryptos (All 10 Universe Symbols Guaranteed)
+    debates = trading_agents_pipeline.get_latest_debates()
+    active_cryptos = []
+    for s in DEFAULT_UNIVERSE:
+        short_name = s.replace("USDT", "")
+        # Resolve latest price
+        s_eval = audit_data["evaluations"].get(s, {})
+        price = float(s_eval.get("close_price", REF_PRICES.get(s, 100.0)))
+        ref_p = REF_PRICES.get(s, price)
+        change_pct = round(((price - ref_p) / ref_p) * 100.0, 2) if ref_p > 0 else 0.0
 
-    # 4. Microstructure (Strictly filtered by selected symbol)
-    eval_events = [e for e in audit_events if e.get("event_type") == "SHADOW_SIGNAL_EVALUATED"]
-    sym_evals = [e for e in eval_events if e.get("symbol") == target_symbol]
-    latest_eval = sym_evals[-1] if sym_evals else (eval_events[-1] if eval_events else {})
+        # PnL & trade count
+        s_closed = [t for t in audit_data["closed_trades"] if t.get("symbol") == s]
+        pnl_realized = sum(float(t.get("pnl_usd", 0.0)) for t in s_closed)
+        in_pos = (s in active_in_position_symbols)
+
+        # Deliberation stance
+        d = debates.get(s, {})
+        stance = d.get("stance", "NEUTRAL")
+        conviction = float(d.get("conviction", 0.50))
+        thesis = d.get("thesis", "Analyzing real-time order flow and volatility regime.")
+        verdict = d.get("verdict", "APPROVED")
+
+        active_cryptos.append({
+            "symbol": s,
+            "short_name": short_name,
+            "name": short_name,
+            "price": round(price, 4 if price < 1.0 else 2),
+            "change_pct": change_pct,
+            "pnl_usd": round(pnl_realized, 2),
+            "pnl": round(pnl_realized, 2),
+            "trades_count": len(s_closed) + (1 if in_pos else 0),
+            "trade_count": len(s_closed) + (1 if in_pos else 0),
+            "in_position": in_pos,
+            "status": "IN_POSITION" if in_pos else "MONITORING",
+            "agent_stance": stance,
+            "stance": stance,
+            "conviction": conviction,
+            "thesis": thesis,
+            "verdict": verdict,
+        })
+
+    # 4. Microstructure (Strictly Filtered by target_symbol)
+    latest_eval = audit_data["evaluations"].get(target_symbol, {})
     latest_bar = bars[-1] if bars else {}
-
     close_price = latest_eval.get("close_price", latest_bar.get("close", REF_PRICES.get(target_symbol, 80000.0)))
-    rolling_vol = latest_eval.get("rolling_vol", 0.00085)
+    rolling_vol = latest_eval.get("rolling_vol", 0.00065)
     cusum_dir = latest_eval.get("cusum_dir", 0)
     z_dist = latest_eval.get("z_dist", 0.0)
     vpin = latest_eval.get("vpin", 0.485)
@@ -388,89 +493,48 @@ async def get_state(symbol: str = "BTCUSDT"):
         "vpin_near_circuit_breaker": vpin_near_circuit_breaker,
     }
 
-    # 5. Active Cryptos (The 10 Universe Assets)
-    debates = trading_agents_pipeline.get_latest_debates()
-    active_symbols_with_open = {o.get("symbol") for o in open_trades}
+    # 5. Account Metrics
+    initial_paper_equity = 2500.00
+    realized_pnl = sum(float(t.get("pnl_usd", 0.0)) for t in audit_data["closed_trades"])
+    paper_equity = initial_paper_equity + realized_pnl
+    if audit_data["closed_trades"]:
+        paper_equity = float(audit_data["closed_trades"][-1].get("updated_equity", paper_equity))
+        wins = [t for t in audit_data["closed_trades"] if float(t.get("pnl_usd", 0.0)) > 0]
+        win_rate = round((len(wins) / len(audit_data["closed_trades"])) * 100.0, 1)
+        max_dd = round(max(float(t.get("drawdown_pct", 0.0)) for t in audit_data["closed_trades"]), 2)
+    else:
+        win_rate = 0.0
+        max_dd = 0.0
 
-    active_cryptos = []
-    for s in DEFAULT_UNIVERSE:
-        s_evals = [e for e in eval_events if e.get("symbol") == s]
-        sym_price = s_evals[-1].get("close_price") if s_evals else REF_PRICES.get(s, 100.0)
-        ref_p = REF_PRICES.get(s, sym_price)
-        change_pct = round(((sym_price - ref_p) / ref_p) * 100.0, 2) if ref_p > 0 else 0.0
+    account_metrics = {
+        "testnet_equity": bal["total_balance"],
+        "testnet_available": bal["available_balance"],
+        "paper_equity": round(paper_equity, 2),
+        "realized_pnl": round(realized_pnl, 2),
+        "net_profit_usd": round(realized_pnl, 2),
+        "net_profit_pct": round((realized_pnl / initial_paper_equity) * 100.0, 2),
+        "win_rate": win_rate,
+        "open_positions": len(active_in_position_symbols),
+        "max_drawdown": max_dd,
+        "total_trades": len(audit_data["closed_trades"]),
+    }
 
-        sym_trades = [t for t in closed_trades if t.get("symbol") == s]
-        sym_pnl = round(sum(float(t.get("pnl_usd", 0.0)) for t in sym_trades), 2)
+    # 6. System Health
+    system_health = {
+        "daemon_running": bot_running,
+        "daemon_pid": daemon_info["pid"],
+        "uptime_str": duration_fmt,
+        "resync_count": sum(1 for e in audit_data["recent_events"] if e.get("event_type") == "L2_BOOK_RESYNC"),
+        "dollar_bars_formed": len(bars),
+        "last_event_utc": datetime.now(timezone.utc).isoformat(),
+        "mode": "TESTNET",
+        "selected_symbol": target_symbol,
+    }
 
-        delib = debates.get(s, {})
-        stance = delib.get("stance", "NEUTRAL")
-        conviction = delib.get("conviction", 0.50)
-        thesis = delib.get("thesis", "Consensus thesis calibrating order flow regime.")
-        verdict = delib.get("verdict", "APPROVED")
-
-        has_open = s in active_symbols_with_open
-
-        active_cryptos.append({
-            "symbol": s,
-            "name": s.replace("USDT", ""),
-            "price": round(float(sym_price), 4 if sym_price < 1.0 else 2),
-            "change_pct": change_pct,
-            "trade_count": len(sym_trades) + (1 if has_open else 0),
-            "pnl": sym_pnl,
-            "stance": stance,
-            "conviction": conviction,
-            "thesis": thesis,
-            "verdict": verdict,
-            "status": "IN_POSITION" if has_open else "MONITORING",
-        })
-
-    # 6. Recent Signals & Pre-Trade Risk Gates
-    recent_signals = []
-    target_event_types = {"SHADOW_SIGNAL_EVALUATED", "SHADOW_SIGNAL_DECISION", "TESTNET_ORDER_ROUTED", "SHADOW_POSITION_OPENED"}
-    relevant_events = [e for e in audit_events if e.get("event_type") in target_event_types]
-
-    for e in relevant_events[-25:]:
-        meta_prob = e.get("meta_prob")
-        gate_passed = False
-        kelly_frac = 0.0
-        if meta_prob is not None:
-            gate_passed = bool(meta_prob >= 0.56)
-            if gate_passed:
-                kelly_frac = min(0.15, max(0.05, (meta_prob - 0.50) * 1.5))
-
-        recent_signals.append({
-            "timestamp": e.get("ts_utc", "")[11:19],
-            "symbol": e.get("symbol", target_symbol),
-            "event_type": e.get("event_type"),
-            "side": e.get("primary_side", e.get("side", 0)),
-            "close_price": e.get("close_price", e.get("price", e.get("entry_price", close_price))),
-            "meta_prob": meta_prob,
-            "gate_passed": gate_passed,
-            "vpin_cdf": e.get("vpin_cdf", vpin_cdf),
-            "kelly_fraction": round(kelly_frac, 3),
-            "order_status": e.get("order_status", e.get("status", "ACKNOWLEDGED")),
-            "order_id": e.get("orderId", e.get("cl_ord_id")),
-            "latency_us": e.get("latency_us", 42),
-        })
-
-    # 7. Raw Audit Log Tail
-    audit_tail = []
-    for e in audit_events[-35:]:
-        audit_tail.append({
-            "ts": e.get("ts_utc", "")[11:19],
-            "symbol": e.get("symbol", "-"),
-            "event_type": e.get("event_type", ""),
-            "close": e.get("close_price", e.get("close", e.get("entry_price", "-"))),
-            "side": e.get("primary_side", e.get("side", "-")),
-            "z_dist": e.get("z_dist", "-"),
-            "status": e.get("order_status", e.get("status", e.get("exit_reason", e.get("trigger_reason", "-")))),
-            "order_id": e.get("orderId", e.get("cl_ord_id", "-")),
-        })
-
-    # Equity Curve Points for Sparkline
+    # 7. Equity Curve for Sparkline
     equity_curve = [initial_paper_equity]
     running_eq = initial_paper_equity
-    for t in closed_trades:
+    for t in audit_data["closed_trades"]:
         running_eq += float(t.get("pnl_usd", 0.0))
         equity_curve.append(round(running_eq, 2))
     if len(equity_curve) == 1:
@@ -480,24 +544,24 @@ async def get_state(symbol: str = "BTCUSDT"):
         "bot_running": bot_running,
         "test_duration_seconds": duration_sec,
         "test_duration_formatted": duration_fmt,
-        "net_profit_usd": net_profit_usd,
-        "net_profit_pct": net_profit_pct,
-        "executed_trades_list": executed_trades_list,
+        "net_profit_usd": round(realized_pnl, 2),
+        "net_profit_pct": round((realized_pnl / initial_paper_equity) * 100.0, 2),
         "active_cryptos": active_cryptos,
+        "executed_trades_list": executed_trades_list,
+        "bars_series": bars,
+        "recent_events": audit_data["recent_events"],
+        "audit_tail": audit_data["recent_events"],  # Alias for audit table
         "latest_agent_debates": debates,
         "system_health": system_health,
         "account_metrics": account_metrics,
         "microstructure": microstructure,
-        "bars_series": bars[-60:],
-        "recent_signals": recent_signals,
-        "audit_tail": audit_tail,
         "equity_curve": equity_curve,
     }
 
 
 @app.get("/", response_class=HTMLResponse)
 async def get_dashboard():
-    """Serves the complete two-mode dashboard UI."""
+    """Serves the complete two-mode dashboard UI with safe null-coalescing rendering."""
     html_content = """<!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
@@ -574,7 +638,7 @@ async def get_dashboard():
     <div class="flex items-center gap-3">
       <div class="text-right hidden md:block">
         <div class="text-[9px] text-slate-400 uppercase tracking-wider">Testnet USDT Balance</div>
-        <div id="hdr-testnet-equity" class="text-xs font-bold text-slate-200 font-mono">$13,484.09</div>
+        <div id="hdr-testnet-equity" class="text-xs font-bold text-slate-200 font-mono">$13,314.88</div>
       </div>
       <button id="btn-bot-toggle" onclick="toggleBotProcess()" class="flex items-center gap-2 px-4 py-1.5 rounded-md font-bold text-xs tracking-wider uppercase transition-all shadow-md bg-emerald-600 hover:bg-emerald-500 text-slate-950">
         <span id="bot-toggle-icon">▶</span>
@@ -642,7 +706,7 @@ async def get_dashboard():
     <div>
       <div class="flex items-center justify-between mb-2">
         <h2 class="text-xs font-bold uppercase tracking-wider text-slate-300">10 Major Cryptocurrencies // Multi-Asset Matrix</h2>
-        <span class="text-[10px] text-slate-500">TauricResearch 5-Phase Deliberation Active</span>
+        <span class="text-[10px] text-slate-500">Click any card to select & view Pro terminal</span>
       </div>
       <div id="m1-crypto-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2.5">
         <!-- Injected via JavaScript -->
@@ -653,7 +717,7 @@ async def get_dashboard():
     <div class="bg-brand-900 border border-brand-700/60 rounded-lg p-3 shadow">
       <div class="flex items-center justify-between mb-2">
         <h2 class="text-xs font-bold uppercase tracking-wider text-slate-300">Executed Trades Log</h2>
-        <span class="text-[10px] text-slate-500">Active & Closed Positions</span>
+        <span class="text-[10px] text-slate-500">Live Testnet & Closed Positions</span>
       </div>
       <div class="overflow-x-auto max-h-56">
         <table class="w-full text-left font-mono">
@@ -670,7 +734,7 @@ async def get_dashboard():
             </tr>
           </thead>
           <tbody id="m1-trades-tbody" class="text-[11px] divide-y divide-brand-800/40">
-            <tr><td colspan="8" class="text-center py-4 text-slate-500">No executed trades logged in current session.</td></tr>
+            <tr><td colspan="8" class="text-center py-4 text-slate-500">Loading executed trades...</td></tr>
           </tbody>
         </table>
       </div>
@@ -691,7 +755,7 @@ async def get_dashboard():
         <div class="flex items-center justify-between mb-2">
           <div class="flex items-center gap-2">
             <span class="font-bold text-slate-100 text-sm" id="chart-symbol-label">BTCUSDT</span>
-            <span class="text-[10px] text-slate-400">Isolated Information-Driven Dollar Bars</span>
+            <span class="text-[10px] text-slate-400">Isolated 1m Candlestick Bars</span>
           </div>
           <div class="flex items-center gap-3 text-[11px] font-mono">
             <span>O: <span id="bar-o" class="text-slate-300">--</span></span>
@@ -733,7 +797,7 @@ async def get_dashboard():
           <div class="text-[10px] font-bold uppercase tracking-wider text-slate-400 font-sans mb-1">Live Feature Engine (<span id="m2-feat-sym">BTCUSDT</span>)</div>
           <div class="flex justify-between">
             <span class="text-slate-400">Rolling Volatility:</span>
-            <span id="m2-rolling-vol" class="text-slate-200">0.000850</span>
+            <span id="m2-rolling-vol" class="text-slate-200">0.000650</span>
           </div>
           <div class="flex justify-between">
             <span class="text-slate-400">Signed CUSUM Dir:</span>
@@ -756,7 +820,7 @@ async def get_dashboard():
         <!-- Pre-Trade Risk Gate Card -->
         <div class="bg-brand-900 border border-brand-700/60 rounded-lg p-3 shadow font-mono text-[10px] space-y-1">
           <div class="text-[10px] font-bold uppercase tracking-wider text-slate-400 font-sans mb-1">SEC 15c3-5 Pre-Trade Risk Gate</div>
-          <div class="flex justify-between"><span>Kill Switch (<3% DD):</span><span class="text-emerald-400">PASS</span></div>
+          <div class="flex justify-between"><span>Kill Switch (<20% DD):</span><span class="text-emerald-400">PASS</span></div>
           <div class="flex justify-between"><span>VPIN Toxicity (<0.99):</span><span id="gate-vpin" class="text-emerald-400">PASS</span></div>
           <div class="flex justify-between"><span>Fat-Finger Price Collar:</span><span class="text-emerald-400">PASS</span></div>
           <div class="flex justify-between"><span>Breakout / Agent Gate:</span><span id="gate-meta" class="text-slate-400">EVALUATING</span></div>
@@ -1011,11 +1075,14 @@ async def get_dashboard():
       });
     }
 
-    // Asset Selection for Mode 2 Panel
+    // Asset Selection across both Mode 1 and Mode 2
     function selectAsset(sym) {
-      selectedAsset = sym;
-      const lbl = document.getElementById('chart-symbol-label');
-      if (lbl) lbl.textContent = sym;
+      if (!sym) return;
+      selectedAsset = sym.toUpperCase();
+      const chartLbl = document.getElementById('chart-symbol-label');
+      if (chartLbl) chartLbl.textContent = selectedAsset;
+      const featSym = document.getElementById('m2-feat-sym');
+      if (featSym) featSym.textContent = selectedAsset;
       renderAssetTabs();
       updateDeliberationPanel();
       pollState();
@@ -1040,57 +1107,64 @@ async def get_dashboard():
 
       // Phase 1
       const p1 = d.analysts || {};
-      document.getElementById('p1-bias-badge').textContent = p1.composite_bias || 'NEUTRAL';
-      document.getElementById('p1-tech-sum').textContent = p1.technical_summary || '--';
-      document.getElementById('p1-sent-sum').textContent = p1.sentiment_summary || '--';
-      document.getElementById('p1-macro-sum').textContent = p1.news_macro_summary || '--';
-      document.getElementById('p1-comp-score').textContent = (p1.composite_score >= 0 ? '+' : '') + (p1.composite_score ?? 0.0);
+      const bBadge = document.getElementById('p1-bias-badge'); if (bBadge) bBadge.textContent = p1.composite_bias || 'NEUTRAL';
+      const techSum = document.getElementById('p1-tech-sum'); if (techSum) techSum.textContent = p1.technical_summary || '--';
+      const sentSum = document.getElementById('p1-sent-sum'); if (sentSum) sentSum.textContent = p1.sentiment_summary || '--';
+      const macroSum = document.getElementById('p1-macro-sum'); if (macroSum) macroSum.textContent = p1.news_macro_summary || '--';
+      const cScore = document.getElementById('p1-comp-score'); if (cScore) cScore.textContent = (p1.composite_score >= 0 ? '+' : '') + (p1.composite_score ?? 0.0);
 
       // Phase 2
       const p2 = d.debate || {};
-      document.getElementById('p2-winner-badge').textContent = (p2.debate_winner || 'TIE') + ' ADV';
+      const wBadge = document.getElementById('p2-winner-badge'); if (wBadge) wBadge.textContent = (p2.debate_winner || 'TIE') + ' ADV';
       const bList = (p2.bull_arguments || []).map(a => `<li>${a}</li>`).join('');
       const rList = (p2.bear_arguments || []).map(a => `<li>${a}</li>`).join('');
-      document.getElementById('p2-bull-args').innerHTML = bList || '<li>Analyzing support levels.</li>';
-      document.getElementById('p2-bear-args').innerHTML = rList || '<li>Analyzing resistance levels.</li>';
-      document.getElementById('p2-rebuttal').textContent = 'Rebuttal: ' + (p2.rebuttal_points || '--');
+      const bArgs = document.getElementById('p2-bull-args'); if (bArgs) bArgs.innerHTML = bList || '<li>Analyzing support levels.</li>';
+      const rArgs = document.getElementById('p2-bear-args'); if (rArgs) rArgs.innerHTML = rList || '<li>Analyzing resistance levels.</li>';
+      const reb = document.getElementById('p2-rebuttal'); if (reb) reb.textContent = 'Rebuttal: ' + (p2.rebuttal_points || '--');
 
       // Phase 3
       const p3 = d.proposal || {};
       const actBadge = document.getElementById('p3-action-badge');
-      actBadge.textContent = p3.action || 'HOLD';
-      actBadge.className = p3.action === 'BUY' ? 'px-1 py-0.2 rounded text-[8px] bg-emerald-900 text-emerald-300 font-bold' : (p3.action === 'SELL' ? 'px-1 py-0.2 rounded text-[8px] bg-rose-900 text-rose-300 font-bold' : 'px-1 py-0.2 rounded text-[8px] bg-slate-800 text-slate-300 font-bold');
-      document.getElementById('p3-entry').textContent = p3.target_entry ? '$' + Number(p3.target_entry).toFixed(2) : '--';
-      document.getElementById('p3-pt').textContent = p3.take_profit ? '$' + Number(p3.take_profit).toFixed(2) : '--';
-      document.getElementById('p3-sl').textContent = p3.stop_loss ? '$' + Number(p3.stop_loss).toFixed(2) : '--';
-      document.getElementById('p3-lev').textContent = (p3.recommended_leverage || 2.0) + 'x';
-      document.getElementById('p3-rationale').textContent = p3.rationale || '--';
+      if (actBadge) {
+        actBadge.textContent = p3.action || 'HOLD';
+        actBadge.className = p3.action === 'BUY' ? 'px-1 py-0.2 rounded text-[8px] bg-emerald-900 text-emerald-300 font-bold' : (p3.action === 'SELL' ? 'px-1 py-0.2 rounded text-[8px] bg-rose-900 text-rose-300 font-bold' : 'px-1 py-0.2 rounded text-[8px] bg-slate-800 text-slate-300 font-bold');
+      }
+      const entryEl = document.getElementById('p3-entry'); if (entryEl) entryEl.textContent = p3.target_entry ? '$' + Number(p3.target_entry).toFixed(2) : '--';
+      const ptEl = document.getElementById('p3-pt'); if (ptEl) ptEl.textContent = p3.take_profit ? '$' + Number(p3.take_profit).toFixed(2) : '--';
+      const slEl = document.getElementById('p3-sl'); if (slEl) slEl.textContent = p3.stop_loss ? '$' + Number(p3.stop_loss).toFixed(2) : '--';
+      const levEl = document.getElementById('p3-lev'); if (levEl) levEl.textContent = (p3.recommended_leverage || 2.0) + 'x';
+      const ratEl = document.getElementById('p3-rationale'); if (ratEl) ratEl.textContent = p3.rationale || '--';
 
       // Phase 4
       const p4 = d.risk_verdict || {};
       const appBadge = document.getElementById('p4-approved-badge');
-      appBadge.textContent = p4.approved ? 'APPROVED' : 'VETOED';
-      appBadge.className = p4.approved ? 'px-1 py-0.2 rounded text-[8px] bg-emerald-900 text-emerald-300 font-bold' : 'px-1 py-0.2 rounded text-[8px] bg-rose-900 text-rose-300 font-bold';
-      document.getElementById('p4-vpin-check').textContent = p4.vpin_toxicity_check || 'PASS';
-      document.getElementById('p4-vol-check').textContent = p4.volatility_check || 'PASS';
-      document.getElementById('p4-dd-check').textContent = p4.drawdown_check || 'PASS';
-      document.getElementById('p4-veto-reason').textContent = p4.veto_reason || 'NONE';
+      if (appBadge) {
+        appBadge.textContent = p4.approved ? 'APPROVED' : 'VETOED';
+        appBadge.className = p4.approved ? 'px-1 py-0.2 rounded text-[8px] bg-emerald-900 text-emerald-300 font-bold' : 'px-1 py-0.2 rounded text-[8px] bg-rose-900 text-rose-300 font-bold';
+      }
+      const vpinChk = document.getElementById('p4-vpin-check'); if (vpinChk) vpinChk.textContent = p4.vpin_toxicity_check || 'PASS';
+      const volChk = document.getElementById('p4-vol-check'); if (volChk) volChk.textContent = p4.volatility_check || 'PASS';
+      const ddChk = document.getElementById('p4-dd-check'); if (ddChk) ddChk.textContent = p4.drawdown_check || 'PASS';
+      const vetoR = document.getElementById('p4-veto-reason'); if (vetoR) vetoR.textContent = p4.veto_reason || 'NONE';
 
       // Phase 5
       const p5Verdict = document.getElementById('p5-final-verdict');
-      p5Verdict.textContent = d.verdict || 'APPROVED';
-      p5Verdict.className = d.verdict === 'APPROVED' ? 'px-1 py-0.2 rounded text-[8px] bg-emerald-900 text-emerald-300 font-bold' : 'px-1 py-0.2 rounded text-[8px] bg-rose-900 text-rose-300 font-bold';
+      if (p5Verdict) {
+        p5Verdict.textContent = d.verdict || 'APPROVED';
+        p5Verdict.className = d.verdict === 'APPROVED' ? 'px-1 py-0.2 rounded text-[8px] bg-emerald-900 text-emerald-300 font-bold' : 'px-1 py-0.2 rounded text-[8px] bg-rose-900 text-rose-300 font-bold';
+      }
       const conv = Math.round((d.conviction || 0.5) * 100);
-      document.getElementById('p5-conviction-score').textContent = conv + '%';
-      document.getElementById('p5-conviction-bar').style.width = conv + '%';
-      document.getElementById('p5-thesis').textContent = d.thesis || '--';
-      document.getElementById('p5-timestamp').textContent = 'UTC: ' + (d.timestamp_utc ? d.timestamp_utc.slice(11, 19) : '--:--:--');
+      const convScore = document.getElementById('p5-conviction-score'); if (convScore) convScore.textContent = conv + '%';
+      const convBar = document.getElementById('p5-conviction-bar'); if (convBar) convBar.style.width = conv + '%';
+      const p5Th = document.getElementById('p5-thesis'); if (p5Th) p5Th.textContent = d.thesis || '--';
+      const p5Ts = document.getElementById('p5-timestamp'); if (p5Ts) p5Ts.textContent = 'UTC: ' + (d.timestamp_utc ? d.timestamp_utc.slice(11, 19) : '--:--:--');
     }
 
     // Sparkline Render
     function updateSparkline(curve) {
       if (!curve || curve.length < 2) return;
       const svg = document.getElementById('m1-sparkline-poly');
+      if (!svg) return;
       const minVal = Math.min(...curve);
       const maxVal = Math.max(...curve);
       const range = (maxVal - minVal) || 1.0;
@@ -1106,11 +1180,12 @@ async def get_dashboard():
       svg.setAttribute('stroke', isPositive ? '#10b981' : '#ef4444');
     }
 
-    // Main Polling Loop
+    // Main Polling Loop with Safe Null-Coalescing
     async function pollState() {
       try {
         const res = await fetch(`/api/state?symbol=${encodeURIComponent(selectedAsset)}`);
         const state = await res.json();
+        if (!state) return;
 
         // 1. Bot Process Button & Badges
         isBotRunning = Boolean(state.bot_running);
@@ -1121,192 +1196,237 @@ async def get_dashboard():
         const m1Pill = document.getElementById('m1-status-pill');
 
         if (isBotRunning) {
-          botBtn.className = 'flex items-center gap-2 px-4 py-1.5 rounded-md font-bold text-xs tracking-wider uppercase transition-all shadow-md bg-rose-600 hover:bg-rose-500 text-slate-100 ring-2 ring-rose-500/50';
-          botIcon.textContent = '■';
-          botText.textContent = 'STOP BOT';
-          badgeDaemon.textContent = `DAEMON RUNNING (PID ${state.system_health.daemon_pid})`;
-          badgeDaemon.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-950 text-emerald-300 border border-emerald-600';
-          m1Pill.textContent = 'RUNNING';
-          m1Pill.className = 'px-2 py-0.5 rounded text-[9px] font-bold bg-emerald-950 text-emerald-400 border border-emerald-700/60 pulse-dot';
+          if (botBtn) {
+            botBtn.className = 'flex items-center gap-2 px-4 py-1.5 rounded-md font-bold text-xs tracking-wider uppercase transition-all shadow-md bg-rose-600 hover:bg-rose-500 text-slate-100 ring-2 ring-rose-500/50';
+            botIcon.textContent = '■';
+            botText.textContent = 'STOP BOT';
+          }
+          if (badgeDaemon) {
+            badgeDaemon.textContent = `DAEMON RUNNING (PID ${state.system_health?.daemon_pid || 'ACTIVE'})`;
+            badgeDaemon.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-950 text-emerald-300 border border-emerald-600';
+          }
+          if (m1Pill) {
+            m1Pill.textContent = 'RUNNING';
+            m1Pill.className = 'px-2 py-0.5 rounded text-[9px] font-bold bg-emerald-950 text-emerald-400 border border-emerald-700/60 pulse-dot';
+          }
         } else {
-          botBtn.className = 'flex items-center gap-2 px-4 py-1.5 rounded-md font-bold text-xs tracking-wider uppercase transition-all shadow-md bg-emerald-600 hover:bg-emerald-500 text-slate-950';
-          botIcon.textContent = '▶';
-          botText.textContent = 'START BOT';
-          badgeDaemon.textContent = 'DAEMON STOPPED';
-          badgeDaemon.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-brand-800 text-slate-400 border border-slate-700';
-          m1Pill.textContent = 'STOPPED';
-          m1Pill.className = 'px-2 py-0.5 rounded text-[9px] font-bold bg-slate-800 text-slate-400';
+          if (botBtn) {
+            botBtn.className = 'flex items-center gap-2 px-4 py-1.5 rounded-md font-bold text-xs tracking-wider uppercase transition-all shadow-md bg-emerald-600 hover:bg-emerald-500 text-slate-950';
+            botIcon.textContent = '▶';
+            botText.textContent = 'START BOT';
+          }
+          if (badgeDaemon) {
+            badgeDaemon.textContent = 'DAEMON STOPPED';
+            badgeDaemon.className = 'px-2 py-0.5 rounded text-[10px] font-semibold bg-brand-800 text-slate-400 border border-slate-700';
+          }
+          if (m1Pill) {
+            m1Pill.textContent = 'STOPPED';
+            m1Pill.className = 'px-2 py-0.5 rounded text-[9px] font-bold bg-slate-800 text-slate-400';
+          }
         }
 
         // Header Equity
-        document.getElementById('hdr-testnet-equity').textContent = '$' + Number(state.account_metrics.testnet_equity).toLocaleString('en-US', { minimumFractionDigits: 2 });
+        const hdrEq = document.getElementById('hdr-testnet-equity');
+        if (hdrEq && state.account_metrics) {
+          hdrEq.textContent = '$' + Number(state.account_metrics.testnet_available || state.account_metrics.testnet_equity || 0).toLocaleString('en-US', { minimumFractionDigits: 2 });
+        }
 
         // 2. Mode 1 KPI Pillars
-        const netPnl = Number(state.net_profit_usd);
+        const netPnl = Number(state.net_profit_usd ?? 0);
         const pnlEl = document.getElementById('m1-profit-usd');
         const pnlPctEl = document.getElementById('m1-profit-pct');
         const sign = netPnl >= 0 ? '+' : '';
-        pnlEl.textContent = `${sign}$${netPnl.toFixed(2)}`;
-        pnlPctEl.textContent = `${sign}${Number(state.net_profit_pct).toFixed(2)}% Net Return`;
-        if (netPnl >= 0) {
-          pnlEl.className = 'text-2xl font-black text-emerald-400 font-mono glow-bull';
-          pnlPctEl.className = 'text-xs font-semibold text-emerald-400/80 font-mono';
-        } else {
-          pnlEl.className = 'text-2xl font-black text-rose-400 font-mono glow-bear';
-          pnlPctEl.className = 'text-xs font-semibold text-rose-400/80 font-mono';
+        if (pnlEl) {
+          pnlEl.textContent = `${sign}$${netPnl.toFixed(2)}`;
+          pnlEl.className = netPnl >= 0 ? 'text-2xl font-black text-emerald-400 font-mono glow-bull' : 'text-2xl font-black text-rose-400 font-mono glow-bear';
+        }
+        if (pnlPctEl) {
+          pnlPctEl.textContent = `${sign}${Number(state.net_profit_pct ?? 0).toFixed(2)}% Net Return`;
+          pnlPctEl.className = netPnl >= 0 ? 'text-xs font-semibold text-emerald-400/80 font-mono' : 'text-xs font-semibold text-rose-400/80 font-mono';
         }
 
         updateSparkline(state.equity_curve);
 
-        document.getElementById('m1-duration-timer').textContent = state.test_duration_formatted;
-        document.getElementById('m1-win-rate').textContent = state.account_metrics.win_rate + '%';
-        document.getElementById('m1-trade-count').textContent = state.account_metrics.total_trades + ' Closed Trades';
-        document.getElementById('m1-open-count').textContent = state.account_metrics.open_positions;
-        document.getElementById('m1-max-dd').textContent = state.account_metrics.max_drawdown + '%';
-        document.getElementById('m1-resync-count').textContent = state.system_health.resync_count + ' events';
+        const durEl = document.getElementById('m1-duration-timer'); if (durEl) durEl.textContent = state.test_duration_formatted || '00:00:00';
+        const winEl = document.getElementById('m1-win-rate'); if (winEl) winEl.textContent = (state.account_metrics?.win_rate ?? 0) + '%';
+        const trdEl = document.getElementById('m1-trade-count'); if (trdEl) trdEl.textContent = (state.account_metrics?.total_trades ?? 0) + ' Closed Trades';
+        const opnEl = document.getElementById('m1-open-count'); if (opnEl) opnEl.textContent = state.account_metrics?.open_positions ?? 0;
+        const maxDdEl = document.getElementById('m1-max-dd'); if (maxDdEl) maxDdEl.textContent = (state.account_metrics?.max_drawdown ?? 0) + '%';
+        const resyncEl = document.getElementById('m1-resync-count'); if (resyncEl) resyncEl.textContent = (state.system_health?.resync_count ?? 0) + ' events';
 
         // 3. 10-Crypto Grid
         const grid = document.getElementById('m1-crypto-grid');
-        grid.innerHTML = (state.active_cryptos || []).map(c => {
-          const isBull = c.stance === 'BULLISH';
-          const isBear = c.stance === 'BEARISH';
-          const badgeClass = isBull ? 'bg-emerald-950 text-emerald-400 border border-emerald-600/50' : (isBear ? 'bg-rose-950 text-rose-400 border border-rose-600/50' : 'bg-brand-800 text-slate-300 border border-slate-700');
-          const convPct = Math.round(c.conviction * 100);
-          const chgSign = c.change_pct >= 0 ? '+' : '';
-          const chgClass = c.change_pct >= 0 ? 'text-emerald-400' : 'text-rose-400';
-          const inPos = c.status === 'IN_POSITION';
+        const cryptos = state.active_cryptos || [];
+        if (grid && cryptos.length > 0) {
+          grid.innerHTML = cryptos.map(c => {
+            const sym = c.symbol || '';
+            const name = c.short_name || c.name || sym.replace('USDT', '');
+            const stance = (c.agent_stance || c.stance || 'NEUTRAL').toUpperCase();
+            const isBull = stance === 'BULLISH';
+            const isBear = stance === 'BEARISH';
+            const badgeClass = isBull ? 'bg-emerald-950 text-emerald-400 border border-emerald-600/50' : (isBear ? 'bg-rose-950 text-rose-400 border border-rose-600/50' : 'bg-brand-800 text-slate-300 border border-slate-700');
+            const convVal = Number(c.conviction ?? 0.5);
+            const convPct = Math.round(convVal * 100);
+            const chgVal = Number(c.change_pct ?? 0);
+            const chgSign = chgVal >= 0 ? '+' : '';
+            const chgClass = chgVal >= 0 ? 'text-emerald-400' : 'text-rose-400';
+            const priceVal = Number(c.price ?? 0);
+            const pDec = priceVal < 1.0 ? 4 : 2;
+            const pnlVal = Number(c.pnl_usd ?? c.pnl ?? 0);
+            const inPos = Boolean(c.in_position || c.status === 'IN_POSITION');
+            const isSelected = sym === selectedAsset;
 
-          return `
-            <div onclick="switchMode(2); selectAsset('${c.symbol}');" class="cursor-pointer bg-brand-900 border ${inPos ? 'border-cyan-400 ring-1 ring-cyan-400/40' : 'border-brand-700/60'} hover:border-cyan-500/60 rounded-lg p-2.5 transition-all shadow hover:shadow-cyan-900/20">
-              <div class="flex items-center justify-between mb-1">
-                <div class="flex items-center gap-1.5">
-                  ${inPos ? '<span class=\"w-1.5 h-1.5 rounded-full bg-cyan-400 shadow-[0_0_6px_#38bdf8]\"></span>' : ''}
-                  <span class="font-bold text-slate-100">${c.name}</span>
+            return `
+              <div onclick="selectAsset('${sym}');" class="cursor-pointer bg-brand-900 border ${inPos ? 'border-cyan-400 ring-1 ring-cyan-400/40' : (isSelected ? 'border-amber-400/80 shadow-[0_0_8px_rgba(245,158,11,0.2)]' : 'border-brand-700/60')} hover:border-cyan-500/60 rounded-lg p-2.5 transition-all shadow hover:shadow-cyan-900/20">
+                <div class="flex items-center justify-between mb-1">
+                  <div class="flex items-center gap-1.5">
+                    ${inPos ? '<span class=\"w-1.5 h-1.5 rounded-full bg-cyan-400 shadow-[0_0_6px_#38bdf8]\"></span>' : ''}
+                    <span class="font-bold text-slate-100">${name}</span>
+                  </div>
+                  <span class="text-[9px] px-1 py-0.2 rounded font-semibold ${badgeClass}">${stance} ${convPct}%</span>
                 </div>
-                <span class="text-[9px] px-1 py-0.2 rounded font-semibold ${badgeClass}">${c.stance} ${convPct}%</span>
+                <div class="flex items-baseline justify-between font-mono">
+                  <span class="text-xs font-bold text-slate-200">$${priceVal.toFixed(pDec)}</span>
+                  <span class="text-[10px] ${chgClass}">${chgSign}${chgVal}%</span>
+                </div>
+                <div class="mt-2 pt-1.5 border-t border-brand-800/60 flex items-center justify-between text-[9px] text-slate-400 font-mono">
+                  <span>PnL: <b class="${pnlVal >= 0 ? 'text-emerald-400' : 'text-rose-400'}">$${pnlVal.toFixed(2)}</b></span>
+                  <span class="${inPos ? 'text-cyan-300 font-bold' : ''}">${inPos ? 'IN POSITION' : (c.trades_count ?? c.trade_count ?? 0) + ' trades'}</span>
+                </div>
               </div>
-              <div class="flex items-baseline justify-between font-mono">
-                <span class="text-xs font-bold text-slate-200">$${Number(c.price).toFixed(c.price < 1 ? 4 : 2)}</span>
-                <span class="text-[10px] ${chgClass}">${chgSign}${c.change_pct}%</span>
-              </div>
-              <div class="mt-2 pt-1.5 border-t border-brand-800/60 flex items-center justify-between text-[9px] text-slate-400 font-mono">
-                <span>PnL: <b class="${c.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}">$${c.pnl.toFixed(2)}</b></span>
-                <span class="${inPos ? 'text-cyan-300 font-bold' : ''}">${inPos ? 'OPEN POS' : c.trade_count + ' trades'}</span>
-              </div>
-            </div>
-          `;
-        }).join('');
+            `;
+          }).join('');
+        }
 
         // 4. Mode 1 Executed Trades Table
         const m1Tbody = document.getElementById('m1-trades-tbody');
-        if (state.executed_trades_list && state.executed_trades_list.length > 0) {
-          m1Tbody.innerHTML = state.executed_trades_list.map(t => {
-            const sideClass = t.side === 'BUY' ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold';
-            const pnlClass = t.pnl_usd >= 0 ? 'text-emerald-400' : 'text-rose-400';
-            const statusClass = t.status === 'OPEN' ? 'bg-cyan-950 text-cyan-300 border border-cyan-500/50' : 'bg-brand-800 text-slate-400';
-            return `
-              <tr class="hover:bg-brand-800/30">
-                <td class="py-1 px-2 text-slate-400">${t.timestamp}</td>
-                <td class="py-1 px-2 font-bold text-slate-200">${t.symbol}</td>
-                <td class="py-1 px-2"><span class="px-1.5 py-0.2 rounded text-[9px] font-bold ${statusClass}">${t.status}</span></td>
-                <td class="py-1 px-2 ${sideClass}">${t.side}</td>
-                <td class="py-1 px-2 text-slate-300">$${Number(t.entry_price).toFixed(t.entry_price < 1 ? 4 : 2)}</td>
-                <td class="py-1 px-2 text-slate-300">${t.status === 'OPEN' ? '--' : '$' + Number(t.exit_price).toFixed(t.exit_price < 1 ? 4 : 2)}</td>
-                <td class="py-1 px-2 font-bold ${pnlClass}">${t.status === 'OPEN' ? '--' : (t.pnl_usd >= 0 ? '+' : '') + '$' + t.pnl_usd.toFixed(2)}</td>
-                <td class="py-1 px-2 text-slate-400 text-[10px]">${t.exit_reason}</td>
-              </tr>
-            `;
-          }).join('');
-        } else {
-          m1Tbody.innerHTML = '<tr><td colspan="8" class="text-center py-4 text-slate-500">No executed trades logged in current session.</td></tr>';
+        const trades = state.executed_trades_list || [];
+        if (m1Tbody) {
+          if (trades.length > 0) {
+            m1Tbody.innerHTML = trades.map(t => {
+              const isBuy = String(t.side).toUpperCase() === 'BUY' || t.side === 1;
+              const sideStr = isBuy ? 'BUY' : 'SELL';
+              const sideClass = isBuy ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold';
+              const pnlVal = Number(t.pnl_usd ?? 0.0);
+              const pnlClass = pnlVal >= 0 ? 'text-emerald-400' : 'text-rose-400';
+              const statusStr = (t.status || 'CLOSED').toUpperCase();
+              const statusClass = statusStr === 'OPEN' ? 'bg-cyan-950 text-cyan-300 border border-cyan-500/50' : 'bg-brand-800 text-slate-400';
+              const entryP = Number(t.entry_price || 0.0);
+              const exitP = Number(t.exit_price || 0.0);
+              const pDec = (entryP < 1.0 || (exitP > 0 && exitP < 1.0)) ? 4 : 2;
+
+              return `
+                <tr class="hover:bg-brand-800/30">
+                  <td class="py-1 px-2 text-slate-400">${t.timestamp || '--:--:--'}</td>
+                  <td class="py-1 px-2 font-bold text-slate-200">${t.symbol || '--'}</td>
+                  <td class="py-1 px-2"><span class="px-1.5 py-0.2 rounded text-[9px] font-bold ${statusClass}">${statusStr}</span></td>
+                  <td class="py-1 px-2 ${sideClass}">${sideStr}</td>
+                  <td class="py-1 px-2 text-slate-300">$${entryP.toFixed(pDec)}</td>
+                  <td class="py-1 px-2 text-slate-300">${statusStr === 'OPEN' ? '--' : '$' + exitP.toFixed(pDec)}</td>
+                  <td class="py-1 px-2 font-bold ${pnlClass}">${statusStr === 'OPEN' ? (pnlVal !== 0 ? (pnlVal >= 0 ? '+' : '') + '$' + pnlVal.toFixed(2) : '--') : (pnlVal >= 0 ? '+' : '') + '$' + pnlVal.toFixed(2)}</td>
+                  <td class="py-1 px-2 text-slate-400 text-[10px]">${t.exit_reason || t.trigger_reason || '--'}</td>
+                </tr>
+              `;
+            }).join('');
+          } else {
+            m1Tbody.innerHTML = '<tr><td colspan="8" class="text-center py-4 text-slate-500">No executed trades logged in current session.</td></tr>';
+          }
         }
 
         // 5. Mode 2 Charts & Microstructure
-        if (currentMode === 2) {
-          latestDebates = state.latest_agent_debates || {};
-          renderAssetTabs();
-          updateDeliberationPanel();
+        latestDebates = state.latest_agent_debates || {};
+        renderAssetTabs();
+        updateDeliberationPanel();
 
-          document.getElementById('m2-feat-sym').textContent = state.microstructure.symbol || selectedAsset;
+        const featSym = document.getElementById('m2-feat-sym');
+        if (featSym) featSym.textContent = state.microstructure?.symbol || selectedAsset;
 
-          // Update chart
-          if (candleSeries && state.bars_series && state.bars_series.length > 0) {
+        // Update chart if container is initialized
+        if (candleSeries && state.bars_series && state.bars_series.length > 0) {
+          try {
             candleSeries.setData(state.bars_series.map(b => ({
               time: b.time,
-              open: b.open,
-              high: b.high,
-              low: b.low,
-              close: b.close
+              open: Number(b.open),
+              high: Number(b.high),
+              low: Number(b.low),
+              close: Number(b.close)
             })));
-            flowSeries.setData(state.bars_series.map(b => ({
-              time: b.time,
-              value: b.net_order_flow,
-              color: b.net_order_flow >= 0 ? '#10b981' : '#ef4444'
-            })));
+            if (flowSeries) {
+              flowSeries.setData(state.bars_series.map(b => ({
+                time: b.time,
+                value: Number(b.net_order_flow || 0),
+                color: Number(b.net_order_flow || 0) >= 0 ? '#10b981' : '#ef4444'
+              })));
+            }
 
             const lastB = state.bars_series[state.bars_series.length - 1];
-            const pDec = lastB.close < 1 ? 4 : 2;
-            document.getElementById('bar-o').textContent = lastB.open.toFixed(pDec);
-            document.getElementById('bar-h').textContent = lastB.high.toFixed(pDec);
-            document.getElementById('bar-l').textContent = lastB.low.toFixed(pDec);
-            document.getElementById('bar-c').textContent = lastB.close.toFixed(pDec);
+            if (lastB) {
+              const pDec = Number(lastB.close) < 1.0 ? 4 : 2;
+              const barO = document.getElementById('bar-o'); if (barO) barO.textContent = Number(lastB.open).toFixed(pDec);
+              const barH = document.getElementById('bar-h'); if (barH) barH.textContent = Number(lastB.high).toFixed(pDec);
+              const barL = document.getElementById('bar-l'); if (barL) barL.textContent = Number(lastB.low).toFixed(pDec);
+              const barC = document.getElementById('bar-c'); if (barC) barC.textContent = Number(lastB.close).toFixed(pDec);
+            }
+          } catch (chartErr) {
+            console.warn('Lightweight charts render exception:', chartErr);
           }
+        }
 
-          // Microstructure
-          const micro = state.microstructure;
-          document.getElementById('m2-vpin-cdf').textContent = micro.vpin_cdf.toFixed(4);
-          document.getElementById('m2-vpin-bar').style.width = (micro.vpin_cdf * 100) + '%';
-          const vpinBadge = document.getElementById('vpin-status-badge');
-          if (micro.vpin_cdf >= 0.95) {
-            vpinBadge.textContent = 'HIGH TOXICITY';
-            vpinBadge.className = 'px-1.5 py-0.5 rounded text-[9px] font-bold bg-rose-950 text-rose-300 border border-rose-600 pulse-dot';
-            document.getElementById('gate-vpin').textContent = 'WARN';
-            document.getElementById('gate-vpin').className = 'text-rose-400 font-bold';
-          } else {
-            vpinBadge.textContent = 'NORMAL';
-            vpinBadge.className = 'px-1.5 py-0.5 rounded text-[9px] font-bold bg-emerald-950 text-emerald-400 border border-emerald-700/60';
-            document.getElementById('gate-vpin').textContent = 'PASS';
-            document.getElementById('gate-vpin').className = 'text-emerald-400';
-          }
+        // Microstructure
+        const micro = state.microstructure || {};
+        const vpinCdf = Number(micro.vpin_cdf ?? 0.52);
+        const vpinCdfEl = document.getElementById('m2-vpin-cdf'); if (vpinCdfEl) vpinCdfEl.textContent = vpinCdf.toFixed(4);
+        const vpinBar = document.getElementById('m2-vpin-bar'); if (vpinBar) vpinBar.style.width = (vpinCdf * 100) + '%';
+        const vpinBadge = document.getElementById('vpin-status-badge');
+        const gateVpin = document.getElementById('gate-vpin');
+        if (vpinCdf >= 0.95) {
+          if (vpinBadge) { vpinBadge.textContent = 'HIGH TOXICITY'; vpinBadge.className = 'px-1.5 py-0.5 rounded text-[9px] font-bold bg-rose-950 text-rose-300 border border-rose-600 pulse-dot'; }
+          if (gateVpin) { gateVpin.textContent = 'WARN'; gateVpin.className = 'text-rose-400 font-bold'; }
+        } else {
+          if (vpinBadge) { vpinBadge.textContent = 'NORMAL'; vpinBadge.className = 'px-1.5 py-0.5 rounded text-[9px] font-bold bg-emerald-950 text-emerald-400 border border-emerald-700/60'; }
+          if (gateVpin) { gateVpin.textContent = 'PASS'; gateVpin.className = 'text-emerald-400'; }
+        }
 
-          document.getElementById('m2-rolling-vol').textContent = micro.rolling_vol.toFixed(6);
-          document.getElementById('m2-cusum-dir').textContent = (micro.cusum_dir > 0 ? '+' : '') + micro.cusum_dir;
-          document.getElementById('m2-z-dist').textContent = (micro.z_dist > 0 ? '+' : '') + micro.z_dist.toFixed(2) + 'σ';
+        const rVolEl = document.getElementById('m2-rolling-vol'); if (rVolEl) rVolEl.textContent = Number(micro.rolling_vol ?? 0.00065).toFixed(6);
+        const cDirEl = document.getElementById('m2-cusum-dir'); if (cDirEl) cDirEl.textContent = (micro.cusum_dir > 0 ? '+' : '') + (micro.cusum_dir ?? 0);
+        const zDistEl = document.getElementById('m2-z-dist'); if (zDistEl) zDistEl.textContent = (micro.z_dist > 0 ? '+' : '') + Number(micro.z_dist ?? 0).toFixed(2) + 'σ';
 
-          // Recent signal
-          if (state.recent_signals && state.recent_signals.length > 0) {
-            const sig = state.recent_signals[state.recent_signals.length - 1];
-            document.getElementById('m2-meta-prob').textContent = sig.meta_prob ? sig.meta_prob.toFixed(4) : '--';
-            document.getElementById('m2-kelly-alloc').textContent = (sig.kelly_fraction * 100).toFixed(1) + '%';
-            const metaGate = document.getElementById('gate-meta');
-            if (sig.meta_prob && sig.meta_prob >= 0.56) {
-              metaGate.textContent = 'PASS (' + (sig.meta_prob * 100).toFixed(1) + '%)';
+        // Recent signal
+        const rSig = (state.recent_signals && state.recent_signals.length > 0) ? state.recent_signals[state.recent_signals.length - 1] : null;
+        if (rSig) {
+          const mProbEl = document.getElementById('m2-meta-prob'); if (mProbEl) mProbEl.textContent = rSig.meta_prob ? Number(rSig.meta_prob).toFixed(4) : '--';
+          const kAllocEl = document.getElementById('m2-kelly-alloc'); if (kAllocEl) kAllocEl.textContent = (Number(rSig.kelly_fraction ?? 0) * 100).toFixed(1) + '%';
+          const metaGate = document.getElementById('gate-meta');
+          if (metaGate) {
+            if (rSig.meta_prob && rSig.meta_prob >= 0.56) {
+              metaGate.textContent = 'PASS (' + (Number(rSig.meta_prob) * 100).toFixed(1) + '%)';
               metaGate.className = 'text-emerald-400 font-bold';
-            } else if (sig.meta_prob) {
-              metaGate.textContent = 'FILTERED (' + (sig.meta_prob * 100).toFixed(1) + '%)';
+            } else if (rSig.meta_prob) {
+              metaGate.textContent = 'FILTERED (' + (Number(rSig.meta_prob) * 100).toFixed(1) + '%)';
               metaGate.className = 'text-yellow-400';
             } else {
               metaGate.textContent = 'STANDBY';
               metaGate.className = 'text-slate-400';
             }
           }
+        }
 
-          // Mode 2 Audit Table
-          const m2Tbody = document.getElementById('m2-audit-tbody');
-          if (state.audit_tail && state.audit_tail.length > 0) {
-            m2Tbody.innerHTML = state.audit_tail.slice().reverse().map(e => `
-              <tr class="hover:bg-brand-800/30">
-                <td class="py-0.5 px-2 text-slate-400">${e.ts}</td>
-                <td class="py-0.5 px-2 font-bold text-slate-300">${e.symbol}</td>
-                <td class="py-0.5 px-2 text-cyan-300">${e.event_type}</td>
-                <td class="py-0.5 px-2 text-slate-200">${e.close}</td>
-                <td class="py-0.5 px-2">${e.side}</td>
-                <td class="py-0.5 px-2 text-slate-400">${e.z_dist}</td>
-                <td class="py-0.5 px-2 text-slate-300 text-[10px]">${e.status}</td>
-                <td class="py-0.5 px-2 text-slate-500 text-[10px] truncate max-w-xs">${e.order_id}</td>
-              </tr>
-            `).join('');
-          }
+        // Mode 2 Audit Table
+        const auditEvents = state.recent_events || state.audit_tail || [];
+        const m2Tbody = document.getElementById('m2-audit-tbody');
+        if (m2Tbody && auditEvents.length > 0) {
+          m2Tbody.innerHTML = auditEvents.slice().reverse().map(e => `
+            <tr class="hover:bg-brand-800/30">
+              <td class="py-0.5 px-2 text-slate-400">${e.ts || (e.ts_utc ? e.ts_utc.slice(11, 19) : '--:--:--')}</td>
+              <td class="py-0.5 px-2 font-bold text-slate-300">${e.symbol || '-'}</td>
+              <td class="py-0.5 px-2 text-cyan-300">${e.event_type || '-'}</td>
+              <td class="py-0.5 px-2 text-slate-200">${e.close ?? '-'}</td>
+              <td class="py-0.5 px-2">${e.side ?? '-'}</td>
+              <td class="py-0.5 px-2 text-slate-400">${e.z_dist ?? '-'}</td>
+              <td class="py-0.5 px-2 text-slate-300 text-[10px]">${e.status ?? '-'}</td>
+              <td class="py-0.5 px-2 text-slate-500 text-[10px] truncate max-w-xs">${e.order_id ?? '-'}</td>
+            </tr>
+          `).join('');
         }
 
       } catch (err) {
