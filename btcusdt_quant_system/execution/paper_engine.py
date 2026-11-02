@@ -103,8 +103,8 @@ class SynchronousPreTradeRiskAndPaperEngine:
         if intent.symbol in self.active_positions:
             return {"status": "SKIPPED", "reason": f"POSITION_ALREADY_OPEN_FOR_{intent.symbol}"}
 
-        # 0b. Maximum concurrent open positions check (strict cap of 3 assets)
-        if len(self.active_positions) >= 3:
+        # 0b. Maximum concurrent open positions check (strict cap of 4 assets)
+        if len(self.active_positions) >= 4:
             return {"status": "FILTERED", "reason": "MAX_CONCURRENT_POSITIONS_REACHED"}
 
         # 1. Out-of-band Kill Switch Check

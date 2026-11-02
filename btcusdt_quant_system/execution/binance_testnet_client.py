@@ -271,7 +271,7 @@ class BinanceFuturesTestnetClient:
         # If requested and primary order succeeded/placed, submit exchange-native TP & SL
         if attach_native_tp_sl and price is not None:
             eff_vol = max(rolling_vol or 0.0020, 0.0010)
-            tp_sl_res = await self.submit_native_tp_sl(
+            tp_sl_res = await self.place_tp_sl_orders(
                 symbol=symbol,
                 side=side_str,
                 entry_price=float(price),
@@ -286,7 +286,7 @@ class BinanceFuturesTestnetClient:
 
         return primary_res
 
-    async def submit_native_tp_sl(
+    async def place_tp_sl_orders(
         self,
         symbol: str,
         side: Union[str, int],
@@ -295,7 +295,10 @@ class BinanceFuturesTestnetClient:
     ) -> Dict[str, Any]:
         """
         Submits exchange-native Stop Loss (STOP_MARKET) and Take Profit (TAKE_PROFIT_MARKET)
-        orders with closePosition=true on Binance Futures Testnet.
+        orders with closePosition="true" and workingType="MARK_PRICE".
+        Attempts direct submission to standard POST /fapi/v1/order, with automatic fallback
+        to POST /fapi/v1/algoOrder if exchange rejects with -4120.
+        sl_price and pt_price are rounded to exact pricePrecision so -1111 is never raised.
         """
         if not self.is_time_synced:
             await self.sync_server_time()
@@ -317,48 +320,72 @@ class BinanceFuturesTestnetClient:
         session = await self._get_session()
         headers = self._get_headers()
 
-        # 1. Stop Loss: STOP_MARKET with closePosition=true via Algo Order API
+        # 1. Stop Loss: STOP_MARKET with closePosition=true
         sl_params = self._sign_payload({
-            "algoType": "CONDITIONAL",
             "symbol": symbol.upper(),
             "side": counter_side,
             "type": "STOP_MARKET",
-            "triggerPrice": sl_str,
+            "stopPrice": sl_str,
             "closePosition": "true",
             "workingType": "MARK_PRICE",
         })
-        sl_url = f"{self.base_url}/fapi/v1/algoOrder?{urlencode(sl_params)}"
+        sl_url = f"{self.base_url}/fapi/v1/order?{urlencode(sl_params)}"
         sl_res = None
         try:
             async with session.post(sl_url, headers=headers) as resp:
                 sl_res = await resp.json()
+                if isinstance(sl_res, dict) and sl_res.get("code") == -4120:
+                    algo_sl_params = self._sign_payload({
+                        "algoType": "CONDITIONAL",
+                        "symbol": symbol.upper(),
+                        "side": counter_side,
+                        "type": "STOP_MARKET",
+                        "triggerPrice": sl_str,
+                        "closePosition": "true",
+                        "workingType": "MARK_PRICE",
+                    })
+                    algo_sl_url = f"{self.base_url}/fapi/v1/algoOrder?{urlencode(algo_sl_params)}"
+                    async with session.post(algo_sl_url, headers=headers) as aresp:
+                        sl_res = await aresp.json()
                 logger.info("Submitted native SL for %s @ %s: %s", symbol, sl_str, sl_res)
         except Exception as e:
             logger.error("Error submitting native SL for %s: %s", symbol, e)
             sl_res = {"error": str(e)}
 
-        # 2. Take Profit: TAKE_PROFIT_MARKET with closePosition=true via Algo Order API
+        # 2. Take Profit: TAKE_PROFIT_MARKET with closePosition=true
         tp_params = self._sign_payload({
-            "algoType": "CONDITIONAL",
             "symbol": symbol.upper(),
             "side": counter_side,
             "type": "TAKE_PROFIT_MARKET",
-            "triggerPrice": pt_str,
+            "stopPrice": pt_str,
             "closePosition": "true",
             "workingType": "MARK_PRICE",
         })
-        tp_url = f"{self.base_url}/fapi/v1/algoOrder?{urlencode(tp_params)}"
+        tp_url = f"{self.base_url}/fapi/v1/order?{urlencode(tp_params)}"
         tp_res = None
         try:
             async with session.post(tp_url, headers=headers) as resp:
                 tp_res = await resp.json()
+                if isinstance(tp_res, dict) and tp_res.get("code") == -4120:
+                    algo_tp_params = self._sign_payload({
+                        "algoType": "CONDITIONAL",
+                        "symbol": symbol.upper(),
+                        "side": counter_side,
+                        "type": "TAKE_PROFIT_MARKET",
+                        "triggerPrice": pt_str,
+                        "closePosition": "true",
+                        "workingType": "MARK_PRICE",
+                    })
+                    algo_tp_url = f"{self.base_url}/fapi/v1/algoOrder?{urlencode(algo_tp_params)}"
+                    async with session.post(algo_tp_url, headers=headers) as aresp:
+                        tp_res = await aresp.json()
                 logger.info("Submitted native TP for %s @ %s: %s", symbol, pt_str, tp_res)
         except Exception as e:
             logger.error("Error submitting native TP for %s: %s", symbol, e)
             tp_res = {"error": str(e)}
 
-        sl_id = sl_res.get("algoId") or sl_res.get("orderId") if isinstance(sl_res, dict) else None
-        tp_id = tp_res.get("algoId") or tp_res.get("orderId") if isinstance(tp_res, dict) else None
+        sl_id = sl_res.get("orderId") or sl_res.get("algoId") if isinstance(sl_res, dict) else None
+        tp_id = tp_res.get("orderId") or tp_res.get("algoId") if isinstance(tp_res, dict) else None
 
         return {
             "symbol": symbol.upper(),
@@ -369,6 +396,9 @@ class BinanceFuturesTestnetClient:
             "sl_response": sl_res,
             "tp_response": tp_res,
         }
+
+    # Backward compatibility alias
+    submit_native_tp_sl = place_tp_sl_orders
 
     async def flatten_all_positions(self, symbols: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """

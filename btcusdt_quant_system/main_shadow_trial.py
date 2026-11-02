@@ -41,7 +41,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from core.orderbook_sync import LocalOrderBookManager
 from core.data_bars import DollarBarAndMicrostructureEngine
 from core.features_labels import generate_primary_signals
-from execution.paper_engine import SynchronousPreTradeRiskAndPaperEngine, OrderIntent
+from execution.paper_engine import SynchronousPreTradeRiskAndPaperEngine, OrderIntent, ActivePaperPosition
 from execution.binance_testnet_client import BinanceFuturesTestnetClient
 from agents.trading_agents_bridge import trading_agents_pipeline
 
@@ -139,6 +139,7 @@ class LiveShadowTrialRunner:
             taker_fee_bps=5.0
         )
         self.risk_engines = {s: self.risk_engine for s in self.symbols}
+        self.order_routing_lock = asyncio.Lock()
 
         # Setup logs
         self.logs_dir = PROJECT_ROOT / "logs"
@@ -279,11 +280,13 @@ class LiveShadowTrialRunner:
 
     async def _cancel_quotes_callback(self, symbol: str) -> None:
         now_iso = datetime.now(timezone.utc).isoformat()
-        print(f"[{now_iso}] [SAFETY] Cancelling resting shadow quotes for {symbol} during L2 resync.", flush=True)
         if self.testnet_client:
             try:
-                res = await self.testnet_client.cancel_all_open_orders(symbol)
-                self._log_event("TESTNET_CANCEL_ALL_OPEN_ORDERS", {"symbol": symbol, "result": res})
+                # Protect active TP/SL if symbol is currently in an open position
+                if symbol not in self.risk_engine.active_positions:
+                    print(f"[{now_iso}] [SAFETY] Cancelling resting shadow quotes for {symbol} during L2 resync.", flush=True)
+                    res = await self.testnet_client.cancel_all_open_orders(symbol)
+                    self._log_event("TESTNET_CANCEL_ALL_OPEN_ORDERS", {"symbol": symbol, "result": res})
             except Exception as e:
                 print(f"[{now_iso}] [TESTNET ERROR] Failed to cancel open orders for {symbol}: {e}", flush=True)
 
@@ -360,119 +363,130 @@ class LiveShadowTrialRunner:
 
             order_status = "NO_PRIMARY_BREAKOUT"
             if ign_trigger or ta_trigger:
-                target_side = primary_side if ign_trigger else (1 if deliberation.proposal.action == "BUY" else -1)
-                effective_prob = meta_prob if ign_trigger else deliberation.conviction_score
-                trigger_reason = "IGNITION_BREAKOUT" if ign_trigger else "TRADING_AGENTS_PM_APPROVED"
+                async with self.order_routing_lock:
+                    active_position_count = len(self.risk_engine.active_positions)
+                    max_concurrent_positions = 4
+                    if active_position_count >= max_concurrent_positions:
+                        order_status = "FILTERED_MAX_CONCURRENT_POSITIONS_REACHED"
+                    elif symbol in self.risk_engine.active_positions:
+                        order_status = f"SKIPPED_POSITION_ALREADY_OPEN_FOR_{symbol}"
+                    else:
+                        target_side = primary_side if ign_trigger else (1 if deliberation.proposal.action == "BUY" else -1)
+                        effective_prob = meta_prob if ign_trigger else deliberation.conviction_score
+                        trigger_reason = "IGNITION_BREAKOUT" if ign_trigger else "TRADING_AGENTS_PM_APPROVED"
 
-                ob_manager = self.ob_managers[symbol]
-                best_bid = max(ob_manager.bids.keys()) if ob_manager.bids else 0.0
-                best_ask = min(ob_manager.asks.keys()) if ob_manager.asks else 0.0
-                mid_price = 0.5 * (best_bid + best_ask) if (best_bid > 0 and best_ask > 0) else close_price
-                limit_price = best_bid if (target_side == 1 and best_bid > 0) else (best_ask if (target_side == -1 and best_ask > 0) else close_price)
+                        ob_manager = self.ob_managers[symbol]
+                        best_bid = max(ob_manager.bids.keys()) if ob_manager.bids else 0.0
+                        best_ask = min(ob_manager.asks.keys()) if ob_manager.asks else 0.0
+                        mid_price = 0.5 * (best_bid + best_ask) if (best_bid > 0 and best_ask > 0) else close_price
+                        limit_price = best_bid if (target_side == 1 and best_bid > 0) else (best_ask if (target_side == -1 and best_ask > 0) else close_price)
 
-                self.order_seq += 1
-                intent = OrderIntent(
-                    cl_ord_id=f"SHADOW_{symbol}_{int(time.time())}_{self.order_seq}",
-                    symbol=symbol,
-                    side=target_side,
-                    limit_price=limit_price,
-                    mid_price=mid_price,
-                    meta_prob=effective_prob,
-                    vpin_cdf=vpin_cdf,
-                    rolling_vol=rolling_vol
-                )
-                decision = self.risk_engine.validate_and_route_shadow_order(intent, self.current_bar_idx[symbol])
-                dec_status = decision.get("status")
+                        self.order_seq += 1
+                        intent = OrderIntent(
+                            cl_ord_id=f"SHADOW_{symbol}_{int(time.time())}_{self.order_seq}",
+                            symbol=symbol,
+                            side=target_side,
+                            limit_price=limit_price,
+                            mid_price=mid_price,
+                            meta_prob=effective_prob,
+                            vpin_cdf=vpin_cdf,
+                            rolling_vol=rolling_vol
+                        )
+                        decision = self.risk_engine.validate_and_route_shadow_order(intent, self.current_bar_idx[symbol])
+                        dec_status = decision.get("status")
 
-                if dec_status in ("OPENED_SHADOW_POSITION", "ACKNOWLEDGED_PAPER"):
-                    order_status = dec_status
+                        if dec_status in ("OPENED_SHADOW_POSITION", "ACKNOWLEDGED_PAPER"):
+                            order_status = dec_status
 
-                    # Log SHADOW_POSITION_OPENED
-                    self._log_event("SHADOW_POSITION_OPENED", {
-                        "symbol": symbol,
-                        "cl_ord_id": intent.cl_ord_id,
-                        "side": target_side,
-                        "entry_price": limit_price,
-                        "pt_price": decision.get("pt_price"),
-                        "sl_price": decision.get("sl_price"),
-                        "qty": decision.get("qty_btc"),
-                        "notional_usd": decision.get("notional_usd"),
-                        "meta_prob": effective_prob,
-                        "trigger_reason": trigger_reason,
-                    })
-                    print(
-                        f"[POSITION OPENED] {symbol:<8} Side={'BUY' if target_side == 1 else 'SELL'} "
-                        f"Price={limit_price:.2f} Notional=${decision.get('notional_usd', 0):.2f} "
-                        f"Reason={trigger_reason}", flush=True
-                    )
-
-                    # Route order to Binance Futures Testnet if in testnet mode
-                    if self.testnet_client:
-                        try:
-                            # 1. Enforce Programmatic Leverage & Margin Type (Capped strictly at 2x max)
-                            rec_lev = 2
-
-                            try:
-                                await self.testnet_client.set_margin_type(symbol, "ISOLATED")
-                                await self.testnet_client.set_leverage(symbol, rec_lev)
-                            except Exception as le:
-                                print(f"[TESTNET] Margin/leverage config for {symbol}: {le}", flush=True)
-
-                            # 2. Portfolio Capital Cap & Sizing Governor (Max $1,000 USDT notional, max 10% equity)
-                            raw_qty = float(decision.get("qty_btc", 0.001))
-                            max_single_notional = min(1000.0, self.risk_engine.equity * 0.10)
-                            if raw_qty * limit_price > max_single_notional:
-                                raw_qty = max_single_notional / limit_price
-                            if raw_qty * limit_price < 50.0:
-                                raw_qty = min(55.0 / limit_price, max_single_notional / limit_price)
-                            qty = format_order_qty(symbol, raw_qty)
-
-                            testnet_order = await self.testnet_client.place_order(
-                                symbol=symbol,
-                                side="BUY" if target_side == 1 else "SELL",
-                                qty=qty,
-                                price=limit_price,
-                                order_type="LIMIT",
-                                time_in_force="GTC",
-                                client_order_id=intent.cl_ord_id,
-                                attach_native_tp_sl=True,
-                                rolling_vol=rolling_vol,
+                            # Log SHADOW_POSITION_OPENED
+                            self._log_event("SHADOW_POSITION_OPENED", {
+                                "symbol": symbol,
+                                "cl_ord_id": intent.cl_ord_id,
+                                "side": target_side,
+                                "entry_price": limit_price,
+                                "pt_price": decision.get("pt_price"),
+                                "sl_price": decision.get("sl_price"),
+                                "qty": decision.get("qty_btc"),
+                                "notional_usd": decision.get("notional_usd"),
+                                "meta_prob": effective_prob,
+                                "trigger_reason": trigger_reason,
+                            })
+                            print(
+                                f"[POSITION OPENED] {symbol:<8} Side={'BUY' if target_side == 1 else 'SELL'} "
+                                f"Price={limit_price:.2f} Notional=${decision.get('notional_usd', 0):.2f} "
+                                f"Reason={trigger_reason}", flush=True
                             )
-                            order_id = testnet_order.get("orderId")
-                            exch_status = testnet_order.get("status", "UNKNOWN")
-                            sl_order_id = testnet_order.get("sl_order_id")
-                            tp_order_id = testnet_order.get("tp_order_id")
-                            pt_price = testnet_order.get("pt_price")
-                            sl_price = testnet_order.get("sl_price")
-                            self._log_event("TESTNET_ORDER_ROUTED", {
-                                "orderId": order_id,
-                                "status": exch_status,
-                                "clientOrderId": intent.cl_ord_id,
-                                "symbol": symbol,
-                                "side": "BUY" if target_side == 1 else "SELL",
-                                "price": limit_price,
-                                "qty": qty,
-                                "leverage": rec_lev,
-                                "margin_type": "ISOLATED",
-                                "slOrderId": sl_order_id,
-                                "tpOrderId": tp_order_id,
-                                "ptPrice": pt_price,
-                                "slPrice": sl_price,
-                                "raw_response": testnet_order
-                            })
-                            print(f"[TESTNET ORDER ROUTED] {symbol} orderId={order_id} (TP={tp_order_id}, SL={sl_order_id}) | status={exch_status} | price={limit_price:.2f} | qty={qty} | lev={rec_lev}x [ISOLATED]", flush=True)
-                        except Exception as e:
-                            print(f"[TESTNET ROUTE ERROR] {symbol}: {e}", flush=True)
-                            self._log_event("TESTNET_ORDER_ROUTED", {
-                                "orderId": None,
-                                "status": f"ERROR_{e}",
-                                "clientOrderId": intent.cl_ord_id,
-                                "symbol": symbol,
-                                "side": "BUY" if target_side == 1 else "SELL",
-                                "price": limit_price,
-                                "qty": decision.get("qty_btc", 0.001)
-                            })
-                elif dec_status == "FILTERED":
+
+                            # Route order to Binance Futures Testnet if in testnet mode
+                            if self.testnet_client:
+                                try:
+                                    # 1. Enforce Programmatic Leverage & Margin Type (Capped strictly at 2x max)
+                                    rec_lev = 2
+
+                                    try:
+                                        await self.testnet_client.set_margin_type(symbol, "ISOLATED")
+                                        await self.testnet_client.set_leverage(symbol, rec_lev)
+                                    except Exception as le:
+                                        print(f"[TESTNET] Margin/leverage config for {symbol}: {le}", flush=True)
+
+                                    # 2. Portfolio Capital Cap & Sizing Governor (Max $1,000 USDT notional, max 10% equity)
+                                    raw_qty = float(decision.get("qty_btc", 0.001))
+                                    max_single_notional = min(1000.0, self.risk_engine.equity * 0.10)
+                                    if raw_qty * limit_price > max_single_notional:
+                                        raw_qty = max_single_notional / limit_price
+                                    if raw_qty * limit_price < 50.0:
+                                        raw_qty = min(55.0 / limit_price, max_single_notional / limit_price)
+                                    qty = format_order_qty(symbol, raw_qty)
+
+                                    testnet_order = await self.testnet_client.place_order(
+                                        symbol=symbol,
+                                        side="BUY" if target_side == 1 else "SELL",
+                                        qty=qty,
+                                        price=limit_price,
+                                        order_type="LIMIT",
+                                        time_in_force="GTC",
+                                        client_order_id=intent.cl_ord_id,
+                                        attach_native_tp_sl=True,
+                                        rolling_vol=rolling_vol,
+                                    )
+                                    order_id = testnet_order.get("orderId")
+                                    exch_status = testnet_order.get("status", "UNKNOWN")
+                                    sl_order_id = testnet_order.get("sl_order_id")
+                                    tp_order_id = testnet_order.get("tp_order_id")
+                                    pt_price = testnet_order.get("pt_price")
+                                    sl_price = testnet_order.get("sl_price")
+                                    self._log_event("TESTNET_ORDER_ROUTED", {
+                                        "orderId": order_id,
+                                        "status": exch_status,
+                                        "clientOrderId": intent.cl_ord_id,
+                                        "symbol": symbol,
+                                        "side": "BUY" if target_side == 1 else "SELL",
+                                        "price": limit_price,
+                                        "qty": qty,
+                                        "leverage": rec_lev,
+                                        "margin_type": "ISOLATED",
+                                        "slOrderId": sl_order_id,
+                                        "tpOrderId": tp_order_id,
+                                        "ptPrice": pt_price,
+                                        "slPrice": sl_price,
+                                        "raw_response": testnet_order
+                                    })
+                                    print(f"[TESTNET ORDER ROUTED] {symbol} orderId={order_id} (TP={tp_order_id}, SL={sl_order_id}) | status={exch_status} | price={limit_price:.2f} | qty={qty} | lev={rec_lev}x [ISOLATED]", flush=True)
+                                except Exception as e:
+                                    print(f"[TESTNET ROUTE ERROR] {symbol}: {e}", flush=True)
+                                    self._log_event("TESTNET_ORDER_ROUTED", {
+                                        "orderId": None,
+                                        "status": f"ERROR_{e}",
+                                        "clientOrderId": intent.cl_ord_id,
+                                        "symbol": symbol,
+                                        "side": "BUY" if target_side == 1 else "SELL",
+                                        "price": limit_price,
+                                        "qty": decision.get("qty_btc", 0.001)
+                                    })
+                        elif dec_status == "FILTERED":
+                            order_status = f"FILTERED_{decision.get('reason', 'BY_RISK_ENGINE')}"
+                        else:
+                            order_status = f"{decision.get('status')}_{decision.get('reason', '')}"
                     order_status = f"FILTERED_{decision.get('reason', 'BY_RISK_ENGINE')}"
                 else:
                     order_status = f"{decision.get('status')}_{decision.get('reason', '')}"
@@ -548,6 +562,9 @@ class LiveShadowTrialRunner:
                 now_ms = int(time.time() * 1000)
                 threshold_ms = 30 * 60 * 1000  # 30 minutes
                 for order in open_orders:
+                    # Never garbage-collect active protection TP/SL orders
+                    if order.get("type") in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+                        continue
                     order_time = int(order.get("time", order.get("updateTime", now_ms)))
                     if now_ms - order_time > threshold_ms:
                         o_sym = order.get("symbol")
@@ -587,6 +604,37 @@ class LiveShadowTrialRunner:
                     await self.testnet_client.set_leverage(s, 2)
                 except Exception as me:
                     print(f"[TESTNET INIT] Margin/leverage warning on {s}: {me}", flush=True)
+
+            # Sync active positions from exchange into risk engine
+            try:
+                pos_list = await self.testnet_client.get_position_risk()
+                for p in pos_list:
+                    amt = float(p.get("positionAmt", 0.0))
+                    sym = p.get("symbol")
+                    if abs(amt) > 0 and sym in self.symbols:
+                        entry_p = float(p.get("entryPrice", 0.0))
+                        pos_side = 1 if amt > 0 else -1
+                        eff_vol = 0.005
+                        pt_p = entry_p * (1.0 + 1.5 * eff_vol) if pos_side == 1 else entry_p * (1.0 - 1.5 * eff_vol)
+                        sl_p = entry_p * (1.0 - 1.5 * eff_vol) if pos_side == 1 else entry_p * (1.0 + 1.5 * eff_vol)
+                        self.risk_engine.active_positions[sym] = ActivePaperPosition(
+                            cl_ord_id=f"TESTNET_RECONNECTED_{sym}",
+                            symbol=sym,
+                            side=pos_side,
+                            entry_price=entry_p,
+                            arrival_mid=entry_p,
+                            qty_btc=abs(amt),
+                            notional_usd=abs(amt) * entry_p,
+                            entry_bar_idx=0,
+                            pt_price=pt_p,
+                            sl_price=sl_p,
+                            entry_ts_ns=time.time_ns(),
+                            meta_prob=0.70,
+                            vpin_at_entry=0.50
+                        )
+                print(f"[TESTNET INIT] Synced {len(self.risk_engine.active_positions)} active exchange positions into risk engine: {list(self.risk_engine.active_positions.keys())}", flush=True)
+            except Exception as pe:
+                print(f"[TESTNET INIT] Position sync warning: {pe}", flush=True)
 
         reconnect_delay = 1.0
         while True:
