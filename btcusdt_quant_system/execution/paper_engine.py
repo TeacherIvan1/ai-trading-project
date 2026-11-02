@@ -7,10 +7,10 @@ from typing import Optional, Dict, List
 class OrderIntent:
     cl_ord_id: str
     symbol: str
-    side: int                # 1 = Long, -1 = Short
+    side: int                # +1 Buy, -1 Sell
     limit_price: float
     mid_price: float
-    meta_prob: float         # Output probability from Meta-Labeling RF
+    meta_prob: float         # Output of secondary ML classifier p_i in [0, 1]
     vpin_cdf: float          # Current empirical CDF of VPIN
     rolling_vol: float
 
@@ -26,6 +26,8 @@ class ActivePaperPosition:
     entry_bar_idx: int
     pt_price: float
     sl_price: float
+    stall_bar_idx: int
+    stall_min_ret: float
     max_bar_idx: int
     meta_prob: float
     entry_ts_ms: int
@@ -33,16 +35,18 @@ class ActivePaperPosition:
 class SynchronousPreTradeRiskAndPaperEngine:
     """
     Closed-loop Shadow Execution & Synchronous Pre-Trade Risk Engine (<100us).
-    Tracks active paper positions across live Triple-Barrier thresholds (PT, SL, Vertical Time).
+    Tracks active paper positions across live Triple-Barrier thresholds (PT, SL, Stall, Vertical Time).
     """
     def __init__(
         self,
         initial_equity: float = 2500.0,
         max_fat_finger_pct: float = 0.005,
         max_daily_drawdown_pct: float = 0.03,
-        pt_mult: float = 1.5,
-        sl_mult: float = 1.5,
-        max_horizon_bars: int = 25,
+        pt_mult: float = 2.0,
+        sl_mult: float = 1.25,
+        max_horizon_bars: int = 40,
+        stall_bars: int = 10,
+        stall_min_sigma: float = 0.20,
         maker_fee_bps: float = 2.0,
         taker_fee_bps: float = 5.0
     ):
@@ -55,6 +59,8 @@ class SynchronousPreTradeRiskAndPaperEngine:
         self.pt_mult = pt_mult
         self.sl_mult = sl_mult
         self.max_horizon_bars = max_horizon_bars
+        self.stall_bars = stall_bars
+        self.stall_min_sigma = stall_min_sigma
 
         self.maker_fee = maker_fee_bps / 10_000.0
         self.taker_fee = taker_fee_bps / 10_000.0
@@ -95,9 +101,9 @@ class SynchronousPreTradeRiskAndPaperEngine:
             return {"status": "REJECTED", "reason": "VPIN_TOXICITY_99TH_PERCENTILE"}
 
         # 3. Meta-Labeling Confidence Gate & Quarter-Kelly Sizing
-        alloc_frac = self.compute_quarter_kelly_fraction(intent.meta_prob, intent.rolling_vol)
+        alloc_frac = self.compute_quarter_kelly_fraction(intent.meta_prob)
         if alloc_frac <= 0.0:
-            return {"status": "FILTERED", "reason": f"LOW_META_PROB ({intent.meta_prob:.3f} < 0.56)"}
+            return {"status": "FILTERED", "reason": f"LOW_META_PROB ({intent.meta_prob:.3f} < 0.54)"}
 
         # 4. Fat-Finger Price Collar Check
         price_dev = abs(intent.limit_price - intent.mid_price) / intent.mid_price
@@ -130,6 +136,8 @@ class SynchronousPreTradeRiskAndPaperEngine:
             entry_bar_idx=current_bar_idx,
             pt_price=pt_price,
             sl_price=sl_price,
+            stall_bar_idx=current_bar_idx + self.stall_bars,
+            stall_min_ret=self.stall_min_sigma * eff_vol,
             max_bar_idx=current_bar_idx + self.max_horizon_bars,
             meta_prob=intent.meta_prob,
             entry_ts_ms=int(time.time() * 1000)
@@ -150,7 +158,7 @@ class SynchronousPreTradeRiskAndPaperEngine:
 
     def check_intrabar_exits(self, trade_price: float, current_bar_idx: int, is_bar_close: bool = False) -> Optional[Dict]:
         """
-        Evaluates live aggTrade / trade prices and Dollar Bar closes against active Triple-Barrier limits.
+        Evaluates live aggTrade prices and Dollar Bar closes against active Triple-Barrier limits.
         """
         pos = self.active_position
         if pos is None:
@@ -180,8 +188,9 @@ class SynchronousPreTradeRiskAndPaperEngine:
                 exit_price = pos.sl_price
                 fee_rate += self.taker_fee
 
-        # 2. Check Vertical Expiration on Dollar Bar closes
+        # 2. Check Mid-Horizon Stall & Vertical Expiration on Dollar Bar closes
         if exit_reason is None and is_bar_close:
+            signed_log_ret = pos.side * math.log(trade_price / pos.entry_price)
             if current_bar_idx >= pos.max_bar_idx:
                 exit_reason = "VERTICAL_TIME_BARRIER"
                 fee_rate += self.taker_fee

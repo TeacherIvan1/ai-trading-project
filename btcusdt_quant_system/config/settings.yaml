@@ -18,6 +18,32 @@ exchange:
   symbol: "BTCUSDT"
   base_asset: "BTC"
   quote_asset: "USDT"
+  mode: "testnet" # "shadow" | "testnet"
+  # Multi-Asset Universe Configuration (Top 10 Liquid USDT Perpetual Futures Pairs)
+  universe_symbols:
+    - "BTCUSDT"
+    - "ETHUSDT"
+    - "SOLUSDT"
+    - "BNBUSDT"
+    - "XRPUSDT"
+    - "ADAUSDT"
+    - "DOGEUSDT"
+    - "AVAXUSDT"
+    - "DOTUSDT"
+    - "LINKUSDT"
+
+  dollar_bar_thresholds:
+    BTCUSDT: 20000000.0  # $20M
+    ETHUSDT: 20000000.0  # $20M
+    SOLUSDT: 5000000.0   # $5M
+    BNBUSDT: 5000000.0   # $5M
+    XRPUSDT: 5000000.0   # $5M
+    ADAUSDT: 5000000.0   # $5M
+    DOGEUSDT: 5000000.0  # $5M
+    AVAXUSDT: 5000000.0  # $5M
+    DOTUSDT: 5000000.0   # $5M
+    LINKUSDT: 5000000.0  # $5M
+
   
   endpoints:
     # Production endpoints
@@ -25,6 +51,10 @@ exchange:
     ws_base_url: "wss://fstream.binance.com"
     
     # Testnet endpoints (if environment is set to testnet)
+    testnet:
+      rest_base_url: "https://testnet.binancefuture.com"
+      ws_stream_url: "wss://stream.binancefuture.com/stream?streams=btcusdt@depth@100ms/btcusdt@aggTrade"
+      rest_depth_url: "https://testnet.binancefuture.com/fapi/v1/depth?symbol=BTCUSDT&limit=1000"
     testnet_rest_url: "https://testnet.binancefuture.com"
     testnet_ws_url: "wss://stream.binancefuture.com"
     
