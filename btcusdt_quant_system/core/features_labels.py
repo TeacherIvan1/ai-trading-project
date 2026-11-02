@@ -51,13 +51,13 @@ def _cusum_signed_numba(diff_vals: np.ndarray, h_arr: np.ndarray) -> np.ndarray:
 def generate_primary_signals(
     df: pd.DataFrame,
     span: int = 40,
-    cusum_mult: float = 1.25,
+    cusum_mult: float = 1.0,
     mode: str = "IGNITION"  # "IGNITION" (early breakout) or "REVERSION" (fade band extremes)
 ) -> pd.DataFrame:
     """
     Generates Primary Signals (+1 Long, -1 Short) on Signed CUSUM structural breaks:
       - IGNITION: Enters at the start of a CUSUM break when order flow confirms direction
-                  and price is NOT yet overextended (< 1.75 sigma from EMA).
+                  and price is NOT yet overextended (0.10 < |z_dist| < 2.50).
       - REVERSION: Fades exhausted CUSUM breaks that stretch beyond 1.75 sigma from EMA.
     """
     out = df.copy()
@@ -82,9 +82,9 @@ def generate_primary_signals(
     primary_side = np.zeros(len(out), dtype=np.int8)
 
     if mode == "IGNITION":
-        # Enter early in the impulse (0.2 < |z_dist| < 1.75) when aggressive order flow confirms
-        long_cond = (cusum_dir == 1) & (out["z_dist"] > 0.20) & (out["z_dist"] < 1.75) & (out["ofi_smooth"] > 0.05)
-        short_cond = (cusum_dir == -1) & (out["z_dist"] < -0.20) & (out["z_dist"] > -1.75) & (out["ofi_smooth"] < -0.05)
+        # Enter early in the impulse (0.10 < |z_dist| < 2.50) when aggressive order flow confirms
+        long_cond = (cusum_dir == 1) & (out["z_dist"] > 0.10) & (out["z_dist"] < 2.50) & (out["ofi_smooth"] > 0.01)
+        short_cond = (cusum_dir == -1) & (out["z_dist"] < -0.10) & (out["z_dist"] > -2.50) & (out["ofi_smooth"] < -0.01)
         primary_side[long_cond] = 1
         primary_side[short_cond] = -1
     else:

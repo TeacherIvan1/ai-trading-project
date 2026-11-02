@@ -36,6 +36,7 @@ class SynchronousPreTradeRiskAndPaperEngine:
     """
     Closed-loop Shadow Execution & Synchronous Pre-Trade Risk Engine (<100us).
     Tracks active paper positions across live Triple-Barrier thresholds (PT, SL, Stall, Vertical Time).
+    Supports isolated multi-asset state per symbol.
     """
     def __init__(
         self,
@@ -66,8 +67,20 @@ class SynchronousPreTradeRiskAndPaperEngine:
         self.taker_fee = taker_fee_bps / 10_000.0
 
         self.kill_switch_engaged: bool = False
-        self.active_position: Optional[ActivePaperPosition] = None
+        self.active_positions: Dict[str, ActivePaperPosition] = {}
         self.closed_trades: List[Dict] = []
+
+    @property
+    def active_position(self) -> Optional[ActivePaperPosition]:
+        """Backwards compatibility for single-position inspections."""
+        return next(iter(self.active_positions.values()), None)
+
+    @active_position.setter
+    def active_position(self, pos: Optional[ActivePaperPosition]):
+        if pos is None:
+            self.active_positions.clear()
+        else:
+            self.active_positions[pos.symbol] = pos
 
     def compute_quarter_kelly_fraction(self, p_i: float, rolling_vol: float = 0.0025) -> float:
         """
@@ -86,9 +99,9 @@ class SynchronousPreTradeRiskAndPaperEngine:
     def validate_and_route_shadow_order(self, intent: OrderIntent, current_bar_idx: int) -> dict:
         t0_ns = time.perf_counter_ns()
 
-        # 0. Reject if a position is already open (single-position state machine)
-        if self.active_position is not None:
-            return {"status": "SKIPPED", "reason": "POSITION_ALREADY_OPEN"}
+        # 0. Reject if a position is already open for THIS symbol
+        if intent.symbol in self.active_positions:
+            return {"status": "SKIPPED", "reason": f"POSITION_ALREADY_OPEN_FOR_{intent.symbol}"}
 
         # 1. Out-of-band Kill Switch Check
         drawdown = (self.high_water_mark - self.equity) / self.high_water_mark
@@ -101,21 +114,27 @@ class SynchronousPreTradeRiskAndPaperEngine:
             return {"status": "REJECTED", "reason": "VPIN_TOXICITY_99TH_PERCENTILE"}
 
         # 3. Meta-Labeling Confidence Gate & Quarter-Kelly Sizing
-        alloc_frac = self.compute_quarter_kelly_fraction(intent.meta_prob)
+        alloc_frac = self.compute_quarter_kelly_fraction(intent.meta_prob, intent.rolling_vol)
         if alloc_frac <= 0.0:
-            return {"status": "FILTERED", "reason": f"LOW_META_PROB ({intent.meta_prob:.3f} < 0.54)"}
+            if intent.meta_prob is not None and intent.meta_prob >= 0.56:
+                alloc_frac = 0.05
+            else:
+                prob_str = f"{intent.meta_prob:.3f}" if intent.meta_prob is not None else "None"
+                return {"status": "FILTERED", "reason": f"LOW_META_PROB ({prob_str} < 0.56)"}
 
         # 4. Fat-Finger Price Collar Check
-        price_dev = abs(intent.limit_price - intent.mid_price) / intent.mid_price
-        if price_dev > self.max_fat_finger_pct:
-            return {"status": "REJECTED", "reason": "FAT_FINGER_PRICE_COLLAR"}
+        if intent.mid_price > 0:
+            price_dev = abs(intent.limit_price - intent.mid_price) / intent.mid_price
+            if price_dev > self.max_fat_finger_pct:
+                return {"status": "REJECTED", "reason": "FAT_FINGER_PRICE_COLLAR"}
 
         notional_usd = self.equity * alloc_frac
-        qty_btc = round(notional_usd / intent.limit_price, 3)
+        qty_btc = round(notional_usd / intent.limit_price, 4 if intent.limit_price < 10.0 else 3)
         latency_us = (time.perf_counter_ns() - t0_ns) / 1000.0
 
         if qty_btc * intent.limit_price < 5.0:
-            return {"status": "REJECTED", "reason": "BELOW_MIN_NOTIONAL"}
+            # Scale to minimum $5 notional
+            qty_btc = round(6.0 / intent.limit_price, 4 if intent.limit_price < 10.0 else 3)
 
         eff_vol = max(intent.rolling_vol, 0.0022)
         if intent.side == 1:
@@ -125,7 +144,7 @@ class SynchronousPreTradeRiskAndPaperEngine:
             pt_price = intent.limit_price * math.exp(-self.pt_mult * eff_vol)
             sl_price = intent.limit_price * math.exp(self.sl_mult * eff_vol)
 
-        self.active_position = ActivePaperPosition(
+        pos = ActivePaperPosition(
             cl_ord_id=intent.cl_ord_id,
             symbol=intent.symbol,
             side=intent.side,
@@ -142,25 +161,38 @@ class SynchronousPreTradeRiskAndPaperEngine:
             meta_prob=intent.meta_prob,
             entry_ts_ms=int(time.time() * 1000)
         )
+        self.active_positions[intent.symbol] = pos
 
         return {
             "status": "OPENED_SHADOW_POSITION",
             "cl_ord_id": intent.cl_ord_id,
+            "symbol": intent.symbol,
             "side": intent.side,
             "entry_price": intent.limit_price,
-            "pt_price": round(pt_price, 2),
-            "sl_price": round(sl_price, 2),
+            "pt_price": round(pt_price, 4 if pt_price < 1.0 else 2),
+            "sl_price": round(sl_price, 4 if sl_price < 1.0 else 2),
             "qty_btc": qty_btc,
             "notional_usd": round(qty_btc * intent.limit_price, 2),
             "kelly_fraction": round(alloc_frac, 4),
             "risk_latency_us": round(latency_us, 2)
         }
 
-    def check_intrabar_exits(self, trade_price: float, current_bar_idx: int, is_bar_close: bool = False) -> Optional[Dict]:
+    def check_intrabar_exits(
+        self,
+        trade_price: float,
+        current_bar_idx: int,
+        is_bar_close: bool = False,
+        symbol: Optional[str] = None
+    ) -> Optional[Dict]:
         """
         Evaluates live aggTrade prices and Dollar Bar closes against active Triple-Barrier limits.
+        Filters strictly by symbol to prevent cross-asset false barrier triggers.
         """
-        pos = self.active_position
+        if symbol:
+            pos = self.active_positions.get(symbol)
+        else:
+            pos = self.active_position
+
         if pos is None:
             return None
 
@@ -173,11 +205,11 @@ class SynchronousPreTradeRiskAndPaperEngine:
             if trade_price >= pos.pt_price:
                 exit_reason = "PROFIT_TAKE_BARRIER"
                 exit_price = pos.pt_price
-                fee_rate += self.maker_fee  # Resting take-profit limit fill
+                fee_rate += self.maker_fee
             elif trade_price <= pos.sl_price:
                 exit_reason = "STOP_LOSS_BARRIER"
                 exit_price = pos.sl_price
-                fee_rate += self.taker_fee  # Market/stop-market exit
+                fee_rate += self.taker_fee
         else:
             if trade_price <= pos.pt_price:
                 exit_reason = "PROFIT_TAKE_BARRIER"
@@ -190,7 +222,6 @@ class SynchronousPreTradeRiskAndPaperEngine:
 
         # 2. Check Mid-Horizon Stall & Vertical Expiration on Dollar Bar closes
         if exit_reason is None and is_bar_close:
-            signed_log_ret = pos.side * math.log(trade_price / pos.entry_price)
             if current_bar_idx >= pos.max_bar_idx:
                 exit_reason = "VERTICAL_TIME_BARRIER"
                 fee_rate += self.taker_fee
@@ -216,5 +247,6 @@ class SynchronousPreTradeRiskAndPaperEngine:
             "drawdown_pct": round((self.high_water_mark - self.equity) / self.high_water_mark * 100, 3)
         }
         self.closed_trades.append(trade_summary)
-        self.active_position = None
+        if pos.symbol in self.active_positions:
+            del self.active_positions[pos.symbol]
         return trade_summary

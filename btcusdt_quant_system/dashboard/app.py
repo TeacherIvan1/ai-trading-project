@@ -55,16 +55,16 @@ DEFAULT_UNIVERSE = [
 ]
 
 REF_PRICES = {
-    "BTCUSDT": 80940.0,
-    "ETHUSDT": 3120.0,
-    "SOLUSDT": 184.5,
-    "BNBUSDT": 595.0,
-    "XRPUSDT": 0.54,
-    "ADAUSDT": 0.35,
-    "DOGEUSDT": 0.145,
-    "AVAXUSDT": 27.8,
-    "DOTUSDT": 4.25,
-    "LINKUSDT": 11.8,
+    "BTCUSDT": 77850.0,
+    "ETHUSDT": 2288.0,
+    "SOLUSDT": 94.0,
+    "BNBUSDT": 704.0,
+    "XRPUSDT": 1.25,
+    "ADAUSDT": 0.19,
+    "DOGEUSDT": 0.075,
+    "AVAXUSDT": 8.56,
+    "DOTUSDT": 0.94,
+    "LINKUSDT": 11.3,
 }
 
 # Process Manager state
@@ -137,17 +137,21 @@ def parse_tail_audit_log(max_lines: int = 500) -> List[Dict[str, Any]]:
     return records
 
 
-def parse_tail_dollar_bars(max_bars: int = 100) -> List[Dict[str, Any]]:
-    """Parses the tail of live_dollar_bars.csv."""
+def parse_tail_dollar_bars(max_bars: int = 100, target_symbol: str = "BTCUSDT") -> List[Dict[str, Any]]:
+    """Parses the tail of live_dollar_bars.csv filtered strictly by target_symbol."""
     if not LIVE_BARS_CSV_PATH.exists():
         return []
     bars = []
     try:
         with open(LIVE_BARS_CSV_PATH, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
-            raw_rows = list(reader)[-max_bars:]
+            raw_rows = list(reader)
+            matching = [
+                r for r in raw_rows
+                if not r.get("symbol") or r.get("symbol").upper() == target_symbol.upper()
+            ]
             last_time = 0
-            for r in raw_rows:
+            for r in matching[-max_bars:]:
                 try:
                     close_ts = int(r["close_ts"])
                     t_sec = int(close_ts / 1000)
@@ -173,7 +177,7 @@ def parse_tail_dollar_bars(max_bars: int = 100) -> List[Dict[str, Any]]:
                         "dollar_volume": float(r.get("dollar_volume", 0.0)),
                         "net_order_flow": float(r.get("net_order_flow", 0.0)),
                         "ticks": int(r.get("ticks", 0)),
-                        "symbol": r.get("symbol", "BTCUSDT"),
+                        "symbol": r.get("symbol", target_symbol),
                     })
                 except Exception:
                     continue
@@ -243,33 +247,40 @@ async def stop_bot():
 
 
 @app.get("/api/state")
-async def get_state():
-    """Full real-time state extraction endpoint for Mode 1 & Mode 2."""
+async def get_state(symbol: str = "BTCUSDT"):
+    """Full real-time state extraction endpoint for Mode 1 & Mode 2 filtered by symbol."""
     global bot_start_time
+    target_symbol = symbol.strip().upper()
     bal = await get_cached_testnet_balance()
     daemon_info = get_daemon_status()
     audit_events = parse_tail_audit_log(500)
-    bars = parse_tail_dollar_bars(100)
+    bars = parse_tail_dollar_bars(100, target_symbol=target_symbol)
 
     bot_running = daemon_info["running"]
-    if bot_running and bot_start_time is None:
-        # Infer start time from recent audit events
-        ts_list = [datetime.fromisoformat(e["ts_utc"]) for e in audit_events if e.get("ts_utc")]
-        if ts_list:
-            bot_start_time = min(ts_list).timestamp()
-        else:
-            bot_start_time = time.time()
-    elif not bot_running:
-        bot_start_time = None
+    duration_sec = 0
+    duration_fmt = "00:00:00"
 
-    if bot_start_time and bot_running:
-        duration_sec = int(time.time() - bot_start_time)
+    # Step 3 Fix: Calculate elapsed time strictly from the current session start
+    if bot_running:
+        session_events = [e for e in audit_events if e.get("event_type") == "BOT_SESSION_STARTED"]
+        if session_events:
+            try:
+                start_dt = datetime.fromisoformat(session_events[-1]["ts_utc"])
+                duration_sec = max(0, int((datetime.now(timezone.utc) - start_dt).total_seconds()))
+            except Exception:
+                duration_sec = int(time.time() - bot_start_time) if bot_start_time else 0
+        elif bot_start_time:
+            duration_sec = max(0, int(time.time() - bot_start_time))
+        else:
+            recent_events = [datetime.fromisoformat(e["ts_utc"]) for e in audit_events[-15:] if e.get("ts_utc")]
+            if recent_events:
+                duration_sec = max(0, int((datetime.now(timezone.utc) - min(recent_events)).total_seconds()))
+
         hrs, rem = divmod(duration_sec, 3600)
         mins, secs = divmod(rem, 60)
         duration_fmt = f"{hrs:02d}:{mins:02d}:{secs:02d}"
     else:
-        duration_sec = 0
-        duration_fmt = "00:00:00"
+        bot_start_time = None
 
     # 1. System Health
     resync_count = sum(1 for e in audit_events if e.get("event_type") == "L2_BOOK_RESYNC")
@@ -286,11 +297,17 @@ async def get_state():
         "dollar_bars_formed": dollar_bars_formed,
         "last_event_utc": last_event_utc,
         "mode": current_mode,
+        "selected_symbol": target_symbol,
     }
 
     # 2. Account & Profit Metrics
     initial_paper_equity = 2500.00
     closed_trades = [e for e in audit_events if e.get("event_type") == "SHADOW_POSITION_CLOSED"]
+    opened_positions = [e for e in audit_events if e.get("event_type") == "SHADOW_POSITION_OPENED"]
+
+    closed_ids = {t.get("cl_ord_id") for t in closed_trades}
+    open_trades = [o for o in opened_positions if o.get("cl_ord_id") not in closed_ids]
+
     realized_pnl = sum(float(t.get("pnl_usd", 0.0)) for t in closed_trades)
     paper_equity = initial_paper_equity + realized_pnl
     if closed_trades:
@@ -305,8 +322,21 @@ async def get_state():
     net_profit_usd = round(realized_pnl, 2)
     net_profit_pct = round((realized_pnl / initial_paper_equity) * 100.0, 2)
 
-    # 3. Executed Trades List
+    # 3. Executed Trades List (Active Open Positions + Completed Trades)
     executed_trades_list = []
+    for o in reversed(open_trades):
+        executed_trades_list.append({
+            "symbol": o.get("symbol", "BTCUSDT"),
+            "side": "BUY" if o.get("side") == 1 else "SELL",
+            "entry_price": float(o.get("entry_price", 0.0)),
+            "exit_price": 0.0,
+            "pnl_usd": 0.0,
+            "net_return_bps": 0.0,
+            "exit_reason": o.get("trigger_reason", "POSITION_OPEN"),
+            "timestamp": o.get("ts_utc", "")[11:19] if o.get("ts_utc") else "--:--:--",
+            "status": "OPEN"
+        })
+
     for t in reversed(closed_trades[-30:]):
         executed_trades_list.append({
             "symbol": t.get("symbol", "BTCUSDT"),
@@ -328,18 +358,18 @@ async def get_state():
         "net_profit_usd": net_profit_usd,
         "net_profit_pct": net_profit_pct,
         "win_rate": round(win_rate, 1),
-        "open_positions": 0,
+        "open_positions": len(open_trades),
         "max_drawdown": round(max_dd, 2),
         "total_trades": len(closed_trades),
     }
 
-    # 4. Microstructure (BTCUSDT primary)
+    # 4. Microstructure (Strictly filtered by selected symbol)
     eval_events = [e for e in audit_events if e.get("event_type") == "SHADOW_SIGNAL_EVALUATED"]
-    btc_evals = [e for e in eval_events if e.get("symbol", "BTCUSDT") == "BTCUSDT"]
-    latest_eval = btc_evals[-1] if btc_evals else (eval_events[-1] if eval_events else {})
+    sym_evals = [e for e in eval_events if e.get("symbol") == target_symbol]
+    latest_eval = sym_evals[-1] if sym_evals else (eval_events[-1] if eval_events else {})
     latest_bar = bars[-1] if bars else {}
 
-    close_price = latest_eval.get("close_price", latest_bar.get("close", 80940.0))
+    close_price = latest_eval.get("close_price", latest_bar.get("close", REF_PRICES.get(target_symbol, 80000.0)))
     rolling_vol = latest_eval.get("rolling_vol", 0.00085)
     cusum_dir = latest_eval.get("cusum_dir", 0)
     z_dist = latest_eval.get("z_dist", 0.0)
@@ -348,7 +378,8 @@ async def get_state():
     vpin_near_circuit_breaker = bool(vpin_cdf >= 0.95)
 
     microstructure = {
-        "close_price": round(float(close_price), 2),
+        "symbol": target_symbol,
+        "close_price": round(float(close_price), 4 if close_price < 1.0 else 2),
         "rolling_vol": round(float(rolling_vol), 6),
         "cusum_dir": int(cusum_dir),
         "z_dist": round(float(z_dist), 2),
@@ -359,11 +390,12 @@ async def get_state():
 
     # 5. Active Cryptos (The 10 Universe Assets)
     debates = trading_agents_pipeline.get_latest_debates()
+    active_symbols_with_open = {o.get("symbol") for o in open_trades}
+
     active_cryptos = []
     for s in DEFAULT_UNIVERSE:
-        # Get latest price for symbol
-        sym_evals = [e for e in eval_events if e.get("symbol") == s]
-        sym_price = sym_evals[-1].get("close_price") if sym_evals else REF_PRICES.get(s, 100.0)
+        s_evals = [e for e in eval_events if e.get("symbol") == s]
+        sym_price = s_evals[-1].get("close_price") if s_evals else REF_PRICES.get(s, 100.0)
         ref_p = REF_PRICES.get(s, sym_price)
         change_pct = round(((sym_price - ref_p) / ref_p) * 100.0, 2) if ref_p > 0 else 0.0
 
@@ -376,23 +408,25 @@ async def get_state():
         thesis = delib.get("thesis", "Consensus thesis calibrating order flow regime.")
         verdict = delib.get("verdict", "APPROVED")
 
+        has_open = s in active_symbols_with_open
+
         active_cryptos.append({
             "symbol": s,
             "name": s.replace("USDT", ""),
             "price": round(float(sym_price), 4 if sym_price < 1.0 else 2),
             "change_pct": change_pct,
-            "trade_count": len(sym_trades),
+            "trade_count": len(sym_trades) + (1 if has_open else 0),
             "pnl": sym_pnl,
             "stance": stance,
             "conviction": conviction,
             "thesis": thesis,
             "verdict": verdict,
-            "status": "MONITORING",
+            "status": "IN_POSITION" if has_open else "MONITORING",
         })
 
     # 6. Recent Signals & Pre-Trade Risk Gates
     recent_signals = []
-    target_event_types = {"SHADOW_SIGNAL_EVALUATED", "SHADOW_SIGNAL_DECISION", "TESTNET_ORDER_ROUTED"}
+    target_event_types = {"SHADOW_SIGNAL_EVALUATED", "SHADOW_SIGNAL_DECISION", "TESTNET_ORDER_ROUTED", "SHADOW_POSITION_OPENED"}
     relevant_events = [e for e in audit_events if e.get("event_type") in target_event_types]
 
     for e in relevant_events[-25:]:
@@ -406,16 +440,16 @@ async def get_state():
 
         recent_signals.append({
             "timestamp": e.get("ts_utc", "")[11:19],
-            "symbol": e.get("symbol", "BTCUSDT"),
+            "symbol": e.get("symbol", target_symbol),
             "event_type": e.get("event_type"),
             "side": e.get("primary_side", e.get("side", 0)),
-            "close_price": e.get("close_price", e.get("price", close_price)),
+            "close_price": e.get("close_price", e.get("price", e.get("entry_price", close_price))),
             "meta_prob": meta_prob,
             "gate_passed": gate_passed,
             "vpin_cdf": e.get("vpin_cdf", vpin_cdf),
             "kelly_fraction": round(kelly_frac, 3),
             "order_status": e.get("order_status", e.get("status", "ACKNOWLEDGED")),
-            "order_id": e.get("orderId"),
+            "order_id": e.get("orderId", e.get("cl_ord_id")),
             "latency_us": e.get("latency_us", 42),
         })
 
@@ -426,10 +460,10 @@ async def get_state():
             "ts": e.get("ts_utc", "")[11:19],
             "symbol": e.get("symbol", "-"),
             "event_type": e.get("event_type", ""),
-            "close": e.get("close_price", e.get("close", "-")),
+            "close": e.get("close_price", e.get("close", e.get("entry_price", "-"))),
             "side": e.get("primary_side", e.get("side", "-")),
             "z_dist": e.get("z_dist", "-"),
-            "status": e.get("order_status", e.get("status", e.get("exit_reason", "-"))),
+            "status": e.get("order_status", e.get("status", e.get("exit_reason", e.get("trigger_reason", "-")))),
             "order_id": e.get("orderId", e.get("cl_ord_id", "-")),
         })
 
@@ -598,7 +632,7 @@ async def get_dashboard():
           </div>
         </div>
         <div class="mt-3 pt-2 border-t border-brand-800 text-[10px] text-slate-400 flex justify-between">
-          <span>Max Drawdown: <span id="m1-max-dd" class="text-slate-300 font-mono">0.0%</span></span>
+          <span>Active Positions: <span id="m1-open-count" class="text-cyan-300 font-bold font-mono">0</span></span>
           <span>L2 Sync Drift: <span id="m1-resync-count" class="text-slate-300 font-mono">0 events</span></span>
         </div>
       </div>
@@ -619,7 +653,7 @@ async def get_dashboard():
     <div class="bg-brand-900 border border-brand-700/60 rounded-lg p-3 shadow">
       <div class="flex items-center justify-between mb-2">
         <h2 class="text-xs font-bold uppercase tracking-wider text-slate-300">Executed Trades Log</h2>
-        <span class="text-[10px] text-slate-500">Closed & Active Positions</span>
+        <span class="text-[10px] text-slate-500">Active & Closed Positions</span>
       </div>
       <div class="overflow-x-auto max-h-56">
         <table class="w-full text-left font-mono">
@@ -627,12 +661,12 @@ async def get_dashboard():
             <tr>
               <th class="py-1 px-2">Time</th>
               <th class="py-1 px-2">Asset</th>
+              <th class="py-1 px-2">Status</th>
               <th class="py-1 px-2">Side</th>
               <th class="py-1 px-2">Entry Price</th>
               <th class="py-1 px-2">Exit Price</th>
               <th class="py-1 px-2">Net PnL ($)</th>
-              <th class="py-1 px-2">Return (bps)</th>
-              <th class="py-1 px-2">Exit Reason</th>
+              <th class="py-1 px-2">Exit / Trigger Reason</th>
             </tr>
           </thead>
           <tbody id="m1-trades-tbody" class="text-[11px] divide-y divide-brand-800/40">
@@ -656,8 +690,8 @@ async def get_dashboard():
       <div class="lg:col-span-8 bg-brand-900 border border-brand-700/60 rounded-lg p-3 shadow flex flex-col">
         <div class="flex items-center justify-between mb-2">
           <div class="flex items-center gap-2">
-            <span class="font-bold text-slate-200" id="chart-symbol-label">BTCUSDT</span>
-            <span class="text-[10px] text-slate-400">Information-Driven Dollar Bars ($20M Threshold)</span>
+            <span class="font-bold text-slate-100 text-sm" id="chart-symbol-label">BTCUSDT</span>
+            <span class="text-[10px] text-slate-400">Isolated Information-Driven Dollar Bars</span>
           </div>
           <div class="flex items-center gap-3 text-[11px] font-mono">
             <span>O: <span id="bar-o" class="text-slate-300">--</span></span>
@@ -696,7 +730,7 @@ async def get_dashboard():
 
         <!-- Microstructure Signals Card -->
         <div class="bg-brand-900 border border-brand-700/60 rounded-lg p-3 shadow font-mono text-[11px] space-y-1.5">
-          <div class="text-[10px] font-bold uppercase tracking-wider text-slate-400 font-sans mb-1">Live Feature Engine</div>
+          <div class="text-[10px] font-bold uppercase tracking-wider text-slate-400 font-sans mb-1">Live Feature Engine (<span id="m2-feat-sym">BTCUSDT</span>)</div>
           <div class="flex justify-between">
             <span class="text-slate-400">Rolling Volatility:</span>
             <span id="m2-rolling-vol" class="text-slate-200">0.000850</span>
@@ -725,7 +759,7 @@ async def get_dashboard():
           <div class="flex justify-between"><span>Kill Switch (<3% DD):</span><span class="text-emerald-400">PASS</span></div>
           <div class="flex justify-between"><span>VPIN Toxicity (<0.99):</span><span id="gate-vpin" class="text-emerald-400">PASS</span></div>
           <div class="flex justify-between"><span>Fat-Finger Price Collar:</span><span class="text-emerald-400">PASS</span></div>
-          <div class="flex justify-between"><span>Meta Gate (>=0.56):</span><span id="gate-meta" class="text-slate-400">NO TRIGGER</span></div>
+          <div class="flex justify-between"><span>Breakout / Agent Gate:</span><span id="gate-meta" class="text-slate-400">EVALUATING</span></div>
         </div>
 
       </div>
@@ -980,8 +1014,11 @@ async def get_dashboard():
     // Asset Selection for Mode 2 Panel
     function selectAsset(sym) {
       selectedAsset = sym;
+      const lbl = document.getElementById('chart-symbol-label');
+      if (lbl) lbl.textContent = sym;
       renderAssetTabs();
       updateDeliberationPanel();
+      pollState();
     }
 
     function renderAssetTabs() {
@@ -1072,7 +1109,7 @@ async def get_dashboard():
     // Main Polling Loop
     async function pollState() {
       try {
-        const res = await fetch('/api/state');
+        const res = await fetch(`/api/state?symbol=${encodeURIComponent(selectedAsset)}`);
         const state = await res.json();
 
         // 1. Bot Process Button & Badges
@@ -1124,6 +1161,7 @@ async def get_dashboard():
         document.getElementById('m1-duration-timer').textContent = state.test_duration_formatted;
         document.getElementById('m1-win-rate').textContent = state.account_metrics.win_rate + '%';
         document.getElementById('m1-trade-count').textContent = state.account_metrics.total_trades + ' Closed Trades';
+        document.getElementById('m1-open-count').textContent = state.account_metrics.open_positions;
         document.getElementById('m1-max-dd').textContent = state.account_metrics.max_drawdown + '%';
         document.getElementById('m1-resync-count').textContent = state.system_health.resync_count + ' events';
 
@@ -1136,11 +1174,15 @@ async def get_dashboard():
           const convPct = Math.round(c.conviction * 100);
           const chgSign = c.change_pct >= 0 ? '+' : '';
           const chgClass = c.change_pct >= 0 ? 'text-emerald-400' : 'text-rose-400';
+          const inPos = c.status === 'IN_POSITION';
 
           return `
-            <div onclick="switchMode(2); selectAsset('${c.symbol}');" class="cursor-pointer bg-brand-900 border border-brand-700/60 hover:border-cyan-500/60 rounded-lg p-2.5 transition-all shadow hover:shadow-cyan-900/20">
+            <div onclick="switchMode(2); selectAsset('${c.symbol}');" class="cursor-pointer bg-brand-900 border ${inPos ? 'border-cyan-400 ring-1 ring-cyan-400/40' : 'border-brand-700/60'} hover:border-cyan-500/60 rounded-lg p-2.5 transition-all shadow hover:shadow-cyan-900/20">
               <div class="flex items-center justify-between mb-1">
-                <span class="font-bold text-slate-100">${c.name}</span>
+                <div class="flex items-center gap-1.5">
+                  ${inPos ? '<span class=\"w-1.5 h-1.5 rounded-full bg-cyan-400 shadow-[0_0_6px_#38bdf8]\"></span>' : ''}
+                  <span class="font-bold text-slate-100">${c.name}</span>
+                </div>
                 <span class="text-[9px] px-1 py-0.2 rounded font-semibold ${badgeClass}">${c.stance} ${convPct}%</span>
               </div>
               <div class="flex items-baseline justify-between font-mono">
@@ -1149,7 +1191,7 @@ async def get_dashboard():
               </div>
               <div class="mt-2 pt-1.5 border-t border-brand-800/60 flex items-center justify-between text-[9px] text-slate-400 font-mono">
                 <span>PnL: <b class="${c.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}">$${c.pnl.toFixed(2)}</b></span>
-                <span>${c.trade_count} trades</span>
+                <span class="${inPos ? 'text-cyan-300 font-bold' : ''}">${inPos ? 'OPEN POS' : c.trade_count + ' trades'}</span>
               </div>
             </div>
           `;
@@ -1161,15 +1203,16 @@ async def get_dashboard():
           m1Tbody.innerHTML = state.executed_trades_list.map(t => {
             const sideClass = t.side === 'BUY' ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold';
             const pnlClass = t.pnl_usd >= 0 ? 'text-emerald-400' : 'text-rose-400';
+            const statusClass = t.status === 'OPEN' ? 'bg-cyan-950 text-cyan-300 border border-cyan-500/50' : 'bg-brand-800 text-slate-400';
             return `
               <tr class="hover:bg-brand-800/30">
                 <td class="py-1 px-2 text-slate-400">${t.timestamp}</td>
                 <td class="py-1 px-2 font-bold text-slate-200">${t.symbol}</td>
+                <td class="py-1 px-2"><span class="px-1.5 py-0.2 rounded text-[9px] font-bold ${statusClass}">${t.status}</span></td>
                 <td class="py-1 px-2 ${sideClass}">${t.side}</td>
-                <td class="py-1 px-2 text-slate-300">$${t.entry_price.toFixed(2)}</td>
-                <td class="py-1 px-2 text-slate-300">$${t.exit_price.toFixed(2)}</td>
-                <td class="py-1 px-2 font-bold ${pnlClass}">${t.pnl_usd >= 0 ? '+' : ''}$${t.pnl_usd.toFixed(2)}</td>
-                <td class="py-1 px-2 ${pnlClass}">${t.net_return_bps > 0 ? '+' : ''}${t.net_return_bps}</td>
+                <td class="py-1 px-2 text-slate-300">$${Number(t.entry_price).toFixed(t.entry_price < 1 ? 4 : 2)}</td>
+                <td class="py-1 px-2 text-slate-300">${t.status === 'OPEN' ? '--' : '$' + Number(t.exit_price).toFixed(t.exit_price < 1 ? 4 : 2)}</td>
+                <td class="py-1 px-2 font-bold ${pnlClass}">${t.status === 'OPEN' ? '--' : (t.pnl_usd >= 0 ? '+' : '') + '$' + t.pnl_usd.toFixed(2)}</td>
                 <td class="py-1 px-2 text-slate-400 text-[10px]">${t.exit_reason}</td>
               </tr>
             `;
@@ -1183,6 +1226,8 @@ async def get_dashboard():
           latestDebates = state.latest_agent_debates || {};
           renderAssetTabs();
           updateDeliberationPanel();
+
+          document.getElementById('m2-feat-sym').textContent = state.microstructure.symbol || selectedAsset;
 
           // Update chart
           if (candleSeries && state.bars_series && state.bars_series.length > 0) {
@@ -1200,10 +1245,11 @@ async def get_dashboard():
             })));
 
             const lastB = state.bars_series[state.bars_series.length - 1];
-            document.getElementById('bar-o').textContent = lastB.open.toFixed(2);
-            document.getElementById('bar-h').textContent = lastB.high.toFixed(2);
-            document.getElementById('bar-l').textContent = lastB.low.toFixed(2);
-            document.getElementById('bar-c').textContent = lastB.close.toFixed(2);
+            const pDec = lastB.close < 1 ? 4 : 2;
+            document.getElementById('bar-o').textContent = lastB.open.toFixed(pDec);
+            document.getElementById('bar-h').textContent = lastB.high.toFixed(pDec);
+            document.getElementById('bar-l').textContent = lastB.low.toFixed(pDec);
+            document.getElementById('bar-c').textContent = lastB.close.toFixed(pDec);
           }
 
           // Microstructure
@@ -1240,7 +1286,7 @@ async def get_dashboard():
               metaGate.textContent = 'FILTERED (' + (sig.meta_prob * 100).toFixed(1) + '%)';
               metaGate.className = 'text-yellow-400';
             } else {
-              metaGate.textContent = 'NO TRIGGER';
+              metaGate.textContent = 'STANDBY';
               metaGate.className = 'text-slate-400';
             }
           }

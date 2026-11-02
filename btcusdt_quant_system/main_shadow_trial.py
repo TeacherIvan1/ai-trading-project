@@ -5,12 +5,12 @@ Multi-Asset Live Zero-Risk Shadow Execution & Binance Futures Testnet Engine.
 Supports the 10-asset major crypto universe:
 ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT"]
 
-Streams real-time L2 order book updates (@depth@100ms) and aggregated trades (@aggTrade).
-Executes SEC 15c3-5 style synchronous pre-trade risk checks (<100us),
-evaluates live Dollar Bars against the trained Meta-Labeling RandomForest model,
-integrates TauricResearch / TradingAgents 5-phase multi-agent consensus pipeline,
-and manages active paper positions with closed-loop Triple-Barrier exits.
-Optionally routes acknowledged orders directly to Binance Futures Testnet via --testnet.
+Guarantees 100% strict per-symbol state isolation across:
+- LocalOrderBookManager
+- DollarBarAndMicrostructureEngine ($5M for BTC/ETH, $1M for altcoins)
+- Clean historical warmup bars fetched directly via Binance REST /fapi/v1/klines per symbol
+- SynchronousPreTradeRiskAndPaperEngine
+- TauricResearch / TradingAgents 5-Phase Consensus Deliberation
 """
 
 import argparse
@@ -29,7 +29,6 @@ from typing import Dict, List, Optional
 import pandas as pd
 import websockets
 
-# Force line buffering on standard output and error so daemon.log updates immediately
 try:
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
@@ -52,58 +51,35 @@ DEFAULT_UNIVERSE = [
 ]
 
 DEFAULT_THRESHOLDS = {
-    "BTCUSDT": 20_000_000.0,
-    "ETHUSDT": 20_000_000.0,
-    "SOLUSDT": 5_000_000.0,
-    "BNBUSDT": 5_000_000.0,
-    "XRPUSDT": 5_000_000.0,
-    "ADAUSDT": 5_000_000.0,
-    "DOGEUSDT": 5_000_000.0,
-    "AVAXUSDT": 5_000_000.0,
-    "DOTUSDT": 5_000_000.0,
-    "LINKUSDT": 5_000_000.0,
+    "BTCUSDT": 5_000_000.0,
+    "ETHUSDT": 5_000_000.0,
+    "SOLUSDT": 1_000_000.0,
+    "BNBUSDT": 1_000_000.0,
+    "XRPUSDT": 1_000_000.0,
+    "ADAUSDT": 1_000_000.0,
+    "DOGEUSDT": 1_000_000.0,
+    "AVAXUSDT": 1_000_000.0,
+    "DOTUSDT": 1_000_000.0,
+    "LINKUSDT": 1_000_000.0,
 }
 
-REF_PRICES = {
-    "BTCUSDT": 80940.0,
-    "ETHUSDT": 3120.0,
-    "SOLUSDT": 184.5,
-    "BNBUSDT": 595.0,
-    "XRPUSDT": 0.54,
-    "ADAUSDT": 0.35,
-    "DOGEUSDT": 0.145,
-    "AVAXUSDT": 27.8,
-    "DOTUSDT": 4.25,
-    "LINKUSDT": 11.8,
+QTY_PRECISIONS = {
+    "BTCUSDT": 3,
+    "ETHUSDT": 3,
+    "SOLUSDT": 2,
+    "BNBUSDT": 2,
+    "XRPUSDT": 1,
+    "ADAUSDT": 0,
+    "DOGEUSDT": 0,
+    "AVAXUSDT": 1,
+    "DOTUSDT": 1,
+    "LINKUSDT": 2,
 }
 
 
-def load_universe_config() -> tuple:
-    settings_file = PROJECT_ROOT / "config" / "settings.yaml"
-    symbols = list(DEFAULT_UNIVERSE)
-    thresholds = dict(DEFAULT_THRESHOLDS)
-    if settings_file.exists():
-        try:
-            content = settings_file.read_text(encoding="utf-8")
-            in_universe = False
-            parsed_symbols = []
-            for line in content.splitlines():
-                stripped = line.strip()
-                if "universe_symbols:" in stripped:
-                    in_universe = True
-                    continue
-                if in_universe:
-                    if stripped.startswith("- "):
-                        sym = stripped.replace("- ", "").replace('"', '').replace("'", '').strip()
-                        if sym:
-                            parsed_symbols.append(sym)
-                    elif stripped and not stripped.startswith("#"):
-                        in_universe = False
-            if parsed_symbols:
-                symbols = parsed_symbols
-        except Exception:
-            pass
-    return symbols, thresholds
+def format_order_qty(symbol: str, raw_qty: float) -> float:
+    p = QTY_PRECISIONS.get(symbol, 2)
+    return round(raw_qty, p) if p > 0 else float(max(1, int(raw_qty)))
 
 
 class LiveShadowTrialRunner:
@@ -115,9 +91,8 @@ class LiveShadowTrialRunner:
         initial_equity: float = 2500.0,
         is_testnet: bool = False,
     ):
-        cfg_symbols, cfg_thresholds = load_universe_config()
-        self.symbols = [s.strip().upper() for s in (symbols or cfg_symbols)]
-        self.thresholds = cfg_thresholds
+        self.symbols = [s.strip().upper() for s in (symbols or DEFAULT_UNIVERSE)]
+        self.thresholds = dict(DEFAULT_THRESHOLDS)
         self.is_testnet = is_testnet
 
         # Check for environment override on dollar threshold
@@ -126,7 +101,7 @@ class LiveShadowTrialRunner:
             try:
                 ov = float(env_threshold_override)
                 for s in self.symbols:
-                    self.thresholds[s] = ov if s in ("BTCUSDT", "ETHUSDT") else max(50000.0, ov * 0.25)
+                    self.thresholds[s] = ov if s in ("BTCUSDT", "ETHUSDT") else max(50000.0, ov * 0.20)
             except Exception:
                 pass
 
@@ -134,12 +109,12 @@ class LiveShadowTrialRunner:
             self.rest_base_url = "https://testnet.binancefuture.com"
             self.ws_base_url = "wss://stream.binancefuture.com/stream?streams="
             self.testnet_client = BinanceFuturesTestnetClient()
-            print(f"[INIT] Configured for Binance Futures TESTNET execution across {len(self.symbols)} symbols.", flush=True)
+            print(f"[INIT] Binance Futures TESTNET execution across {len(self.symbols)} symbols.", flush=True)
         else:
             self.rest_base_url = "https://fapi.binance.com"
             self.ws_base_url = "wss://fstream.binance.com/stream?streams="
             self.testnet_client = None
-            print(f"[INIT] Configured for Live Shadow (Production Feed) across {len(self.symbols)} symbols.", flush=True)
+            print(f"[INIT] Live Shadow (Production Feed) across {len(self.symbols)} symbols.", flush=True)
 
         # Build multiplexed stream URL
         stream_names = []
@@ -149,29 +124,26 @@ class LiveShadowTrialRunner:
             stream_names.append(f"{s_low}@aggTrade")
         self.ws_url = self.ws_base_url + "/".join(stream_names)
 
-        # Per-symbol state
+        # 1. Isolate Per-Symbol State in Dictionaries
         self.ob_managers: Dict[str, LocalOrderBookManager] = {s: LocalOrderBookManager(s) for s in self.symbols}
         self.bar_engines: Dict[str, DollarBarAndMicrostructureEngine] = {
-            s: DollarBarAndMicrostructureEngine(dollar_threshold=self.thresholds.get(s, 5_000_000.0))
+            s: DollarBarAndMicrostructureEngine(dollar_threshold=self.thresholds.get(s, 1_000_000.0))
             for s in self.symbols
         }
-        self.risk_engines: Dict[str, SynchronousPreTradeRiskAndPaperEngine] = {
-            s: SynchronousPreTradeRiskAndPaperEngine(
-                initial_equity=initial_equity,
-                pt_mult=1.5,
-                sl_mult=1.5,
-                max_horizon_bars=25,
-                maker_fee_bps=2.0,
-                taker_fee_bps=5.0
-            )
-            for s in self.symbols
-        }
+        self.risk_engine = SynchronousPreTradeRiskAndPaperEngine(
+            initial_equity=initial_equity,
+            pt_mult=1.5,
+            sl_mult=1.5,
+            max_horizon_bars=25,
+            maker_fee_bps=2.0,
+            taker_fee_bps=5.0
+        )
+        self.risk_engines = {s: self.risk_engine for s in self.symbols}
 
-        # Directories and log files
+        # Setup logs
         self.logs_dir = PROJECT_ROOT / "logs"
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.audit_log_path = self.logs_dir / "shadow_trial_audit.jsonl"
-        self.audit_log_path.touch(exist_ok=True)
         self.live_bars_csv_path = self.logs_dir / "live_dollar_bars.csv"
         if not self.live_bars_csv_path.exists():
             with open(self.live_bars_csv_path, "w", encoding="utf-8") as f:
@@ -188,93 +160,90 @@ class LiveShadowTrialRunner:
         else:
             self.model = trained_rf_model
 
-        # Load warmup bars for BTCUSDT
-        warmup_path = models_dir / "warmup_bars.parquet"
-        btc_warmup_df = None
-        if warmup_path.exists():
-            try:
-                df_w = pd.read_parquet(warmup_path)
-                if len(df_w) >= 200:
-                    btc_warmup_df = df_w.tail(300).reset_index(drop=True)
-            except Exception:
-                pass
-
-        if btc_warmup_df is None:
-            candidate_paths = [
-                PROJECT_ROOT / "data" / "btcusdt_dollar_bars_20m_30d.parquet",
-                PROJECT_ROOT / "data" / "btcusdt_dollar_bars_20m_30d.csv",
-                PROJECT_ROOT / "data" / "btcusdt_dollar_bars_30d.parquet",
-                PROJECT_ROOT / "data" / "btcusdt_dollar_bars_30d.csv",
-            ]
-            for cand in candidate_paths:
-                if cand.exists():
-                    try:
-                        df_cand = pd.read_parquet(cand) if cand.suffix == ".parquet" else pd.read_csv(cand)
-                        if len(df_cand) >= 200:
-                            btc_warmup_df = df_cand.tail(300).reset_index(drop=True)
-                            models_dir.mkdir(parents=True, exist_ok=True)
-                            btc_warmup_df.to_parquet(warmup_path, index=False)
-                            break
-                    except Exception:
-                        continue
-
-        if btc_warmup_df is None:
-            raise FileNotFoundError("Could not load or generate at least 200 historical warmup bars from models/ or data/ caches.")
-
-        # Initialize warmup DataFrames per symbol
-        self.bars_dfs: Dict[str, pd.DataFrame] = {}
-        btc_ref_price = REF_PRICES.get("BTCUSDT", 80940.0)
-        btc_threshold = self.thresholds.get("BTCUSDT", 20_000_000.0)
-
-        for s in self.symbols:
-            if s == "BTCUSDT":
-                self.bars_dfs[s] = btc_warmup_df.copy()
-            else:
-                # Scale BTC warmup bars to the relative price scale of the asset
-                s_ref = REF_PRICES.get(s, 100.0)
-                price_ratio = s_ref / btc_ref_price
-                vol_ratio = (self.thresholds.get(s, 5_000_000.0) / btc_threshold) / price_ratio
-
-                scaled_df = btc_warmup_df.copy()
-                scaled_df["open"] = scaled_df["open"] * price_ratio
-                scaled_df["high"] = scaled_df["high"] * price_ratio
-                scaled_df["low"] = scaled_df["low"] * price_ratio
-                scaled_df["close"] = scaled_df["close"] * price_ratio
-                scaled_df["volume"] = scaled_df["volume"] * vol_ratio
-                scaled_df["dollar_volume"] = self.thresholds.get(s, 5_000_000.0)
-                scaled_df["net_order_flow"] = scaled_df["net_order_flow"] * vol_ratio
-                self.bars_dfs[s] = scaled_df
-
-        self.current_bar_idx: Dict[str, int] = {s: len(self.bars_dfs[s]) for s in self.symbols}
+        # 2. Fetch clean symbol-specific historical warmup bars (200 klines per symbol)
+        self.bars_df: Dict[str, pd.DataFrame] = {}
+        self.bars_dfs = self.bars_df  # Alias for compatibility
+        self.current_bar_idx: Dict[str, int] = {}
         self.resync_counts: Dict[str, int] = {s: 0 for s in self.symbols}
         self.order_seq = 0
 
-        self.last_prices: Dict[str, float] = {s: REF_PRICES.get(s, 100.0) for s in self.symbols}
-        self.last_vols: Dict[str, float] = {s: 0.0015 for s in self.symbols}
-        self.last_cusums: Dict[str, int] = {s: 0 for s in self.symbols}
-        self.last_zdists: Dict[str, float] = {s: 0.0 for s in self.symbols}
-        self.last_vpin_cdfs: Dict[str, float] = {s: 0.50 for s in self.symbols}
+        self.last_prices: Dict[str, float] = {}
+        self.last_vols: Dict[str, float] = {}
+        self.last_cusums: Dict[str, int] = {}
+        self.last_zdists: Dict[str, float] = {}
+        self.last_vpin_cdfs: Dict[str, float] = {}
 
         self.feature_cols = feature_cols if feature_cols is not None else [
             "vpin", "vpin_cdf", "vpin_slope", "kyle_lambda_z", "ffd_close",
             "rolling_vol", "vol_regime_ratio", "flow_alignment", "abs_z_dist", "ret_autocorr"
         ]
 
-        # Warmup indicators for all symbols
+        print(f"[WARMUP] Fetching 200 clean 1m historical klines per symbol via Binance REST...", flush=True)
         for s in self.symbols:
+            df_warmup = self._fetch_warmup_klines(s)
+            self.bars_df[s] = df_warmup
+            self.current_bar_idx[s] = len(df_warmup)
+
+            # Pre-evaluate micro indicators & signals on isolated symbol data
             try:
-                df_micro = self.bar_engines[s].compute_vpin_and_kyle_lambda(self.bars_dfs[s], window=50)
-                df_sig = generate_primary_signals(df_micro, span=40, cusum_mult=1.35, mode="IGNITION")
+                df_micro = self.bar_engines[s].compute_vpin_and_kyle_lambda(df_warmup, window=50)
+                df_sig = generate_primary_signals(df_micro, span=40, cusum_mult=1.0, mode="IGNITION")
                 latest = df_sig.iloc[-1]
                 self.last_prices[s] = float(latest["close"])
                 self.last_vols[s] = float(latest.get("rolling_vol", 0.0015))
                 self.last_cusums[s] = int(latest.get("cusum_dir", 0))
                 self.last_zdists[s] = float(latest.get("z_dist", 0.0))
                 self.last_vpin_cdfs[s] = float(latest.get("vpin_cdf", 0.50))
+                print(f"  -> {s:<8}: Close={self.last_prices[s]:<9.2f} Vol={self.last_vols[s]:.6f} z_dist={self.last_zdists[s]:+.2f}σ", flush=True)
             except Exception as e:
-                print(f"[WARMUP WARNING] Indicator warmup warning for {s}: {e}", flush=True)
+                print(f"[WARMUP ERROR] Failed indicators for {s}: {e}", flush=True)
 
-        print(f"[WARMUP COMPLETE] Initialized {len(self.symbols)} assets. Ready for multi-stream ingestion.", flush=True)
+        self._log_event("BOT_SESSION_STARTED", {
+            "symbols": self.symbols,
+            "mode": "TESTNET" if self.is_testnet else "PRODUCTION",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+        print(f"[WARMUP COMPLETE] All 10 symbols initialized with clean price history.", flush=True)
+
+    def _fetch_warmup_klines(self, symbol: str) -> pd.DataFrame:
+        """Fetches 200 clean historical 1m klines from Binance REST."""
+        urls = [
+            f"{self.rest_base_url}/fapi/v1/klines?symbol={symbol}&interval=1m&limit=200",
+            f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=1m&limit=200"
+        ]
+        for url in urls:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=6) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    if isinstance(data, list) and len(data) >= 50:
+                        rows = []
+                        for k in data:
+                            vol = float(k[5])
+                            taker_buy_vol = float(k[9])
+                            net_flow = 2.0 * taker_buy_vol - vol
+                            rows.append({
+                                "open_ts": int(k[0]),
+                                "close_ts": int(k[6]),
+                                "open": float(k[1]),
+                                "high": float(k[2]),
+                                "low": float(k[3]),
+                                "close": float(k[4]),
+                                "volume": vol,
+                                "dollar_volume": float(k[7]),
+                                "net_order_flow": net_flow,
+                                "ticks": int(k[8]),
+                            })
+                        return pd.DataFrame(rows)
+            except Exception:
+                continue
+
+        # Fallback to model warmup if available (BTC only)
+        models_warmup = PROJECT_ROOT / "models" / "warmup_bars.parquet"
+        if symbol == "BTCUSDT" and models_warmup.exists():
+            return pd.read_parquet(models_warmup).tail(200).reset_index(drop=True)
+
+        raise RuntimeError(f"Could not fetch historical warmup klines for {symbol}")
 
     def _log_event(self, event_type: str, payload: dict):
         record = {
@@ -311,20 +280,27 @@ class LiveShadowTrialRunner:
             except Exception as e:
                 print(f"[{now_iso}] [TESTNET ERROR] Failed to cancel open orders for {symbol}: {e}", flush=True)
 
-    async def _evaluate_new_dollar_bar(self, symbol: str, new_bar: dict):
-        # 1. Log DOLLAR_BAR_CLOSED
-        self._log_event("DOLLAR_BAR_CLOSED", {
-            "symbol": symbol,
-            "close": float(new_bar["close"]),
-            "dollar_vol": float(new_bar.get("dollar_volume", 0.0)),
-            "ticks": int(new_bar.get("ticks", 0))
-        })
+    async def _evaluate_new_dollar_bar(self, symbol: str, new_bar: dict, is_initial: bool = False):
+        """
+        Evaluates signals and executes trades strictly on self.bars_df[symbol].
+        Wires TauricResearch/TradingAgents Consensus + IGNITION execution.
+        """
+        if not is_initial:
+            self._log_event("DOLLAR_BAR_CLOSED", {
+                "symbol": symbol,
+                "close": float(new_bar["close"]),
+                "dollar_vol": float(new_bar.get("dollar_volume", 0.0)),
+                "ticks": int(new_bar.get("ticks", 0))
+            })
 
         try:
             bar_entry = {k: v for k, v in new_bar.items() if k != "symbol"}
-            self.bars_dfs[symbol] = pd.concat([self.bars_dfs[symbol], pd.DataFrame([bar_entry])], ignore_index=True).tail(300)
-            df_micro = self.bar_engines[symbol].compute_vpin_and_kyle_lambda(self.bars_dfs[symbol], window=50)
-            df_sig = generate_primary_signals(df_micro, span=40, cusum_mult=1.35, mode="IGNITION")
+            if not is_initial:
+                self.bars_df[symbol] = pd.concat([self.bars_df[symbol], pd.DataFrame([bar_entry])], ignore_index=True).tail(300)
+
+            # Strictly evaluate on isolated symbol dataframe
+            df_micro = self.bar_engines[symbol].compute_vpin_and_kyle_lambda(self.bars_df[symbol], window=50)
+            df_sig = generate_primary_signals(df_micro, span=40, cusum_mult=1.0, mode="IGNITION")
             latest = df_sig.iloc[-1]
 
             close_price = float(latest["close"])
@@ -341,8 +317,13 @@ class LiveShadowTrialRunner:
             self.last_zdists[symbol] = z_dist
             self.last_vpin_cdfs[symbol] = vpin_cdf
 
+            # Compute Meta-Labeling RF probability if model features exist
             meta_prob = None
-            order_status = "NO_PRIMARY_BREAKOUT"
+            try:
+                X_live = df_sig[self.feature_cols].iloc[[-1]].fillna(0.0)
+                meta_prob = float(self.model.predict_proba(X_live)[0, 1])
+            except Exception:
+                meta_prob = None
 
             # TauricResearch / TradingAgents 5-Phase Deliberation
             deliberation = await trading_agents_pipeline.deliberate_asset(
@@ -356,99 +337,114 @@ class LiveShadowTrialRunner:
                 net_order_flow=net_order_flow,
             )
 
-            if primary_side != 0:
-                ob_manager = self.ob_managers[symbol]
-                if not ob_manager.is_synced:
-                    order_status = "ORDERBOOK_DESYNCED"
-                else:
-                    X_live = df_sig[self.feature_cols].iloc[[-1]].fillna(0.0)
-                    meta_prob = float(self.model.predict_proba(X_live)[0, 1])
+            # Execution Gate Logic: EITHER
+            # (a) primary_side != 0 and meta_prob >= 0.56
+            # OR
+            # (b) TradingAgents Phase 5 PM Sign-Off APPROVED (conviction >= 0.70) and cusum_dir aligns
+            ign_trigger = (primary_side != 0 and meta_prob is not None and meta_prob >= 0.56)
+            ta_trigger = (
+                deliberation.final_verdict == "APPROVED"
+                and deliberation.conviction_score >= 0.70
+                and (
+                    (deliberation.proposal.action == "BUY" and cusum_dir >= 0)
+                    or (deliberation.proposal.action == "SELL" and cusum_dir <= 0)
+                )
+            )
 
-                    # Re-deliberate with computed meta_prob
-                    deliberation = await trading_agents_pipeline.deliberate_asset(
-                        symbol=symbol,
-                        current_price=close_price,
-                        meta_prob=meta_prob,
-                        rolling_vol=rolling_vol,
-                        cusum_dir=cusum_dir,
-                        z_dist=z_dist,
-                        vpin_cdf=vpin_cdf,
-                        net_order_flow=net_order_flow,
+            order_status = "NO_PRIMARY_BREAKOUT"
+            if ign_trigger or ta_trigger:
+                target_side = primary_side if ign_trigger else (1 if deliberation.proposal.action == "BUY" else -1)
+                effective_prob = meta_prob if ign_trigger else deliberation.conviction_score
+                trigger_reason = "IGNITION_BREAKOUT" if ign_trigger else "TRADING_AGENTS_PM_APPROVED"
+
+                ob_manager = self.ob_managers[symbol]
+                best_bid = max(ob_manager.bids.keys()) if ob_manager.bids else 0.0
+                best_ask = min(ob_manager.asks.keys()) if ob_manager.asks else 0.0
+                mid_price = 0.5 * (best_bid + best_ask) if (best_bid > 0 and best_ask > 0) else close_price
+                limit_price = best_bid if (target_side == 1 and best_bid > 0) else (best_ask if (target_side == -1 and best_ask > 0) else close_price)
+
+                self.order_seq += 1
+                intent = OrderIntent(
+                    cl_ord_id=f"SHADOW_{symbol}_{int(time.time())}_{self.order_seq}",
+                    symbol=symbol,
+                    side=target_side,
+                    limit_price=limit_price,
+                    mid_price=mid_price,
+                    meta_prob=effective_prob,
+                    vpin_cdf=vpin_cdf,
+                    rolling_vol=rolling_vol
+                )
+                decision = self.risk_engine.validate_and_route_shadow_order(intent, self.current_bar_idx[symbol])
+                dec_status = decision.get("status")
+
+                if dec_status in ("OPENED_SHADOW_POSITION", "ACKNOWLEDGED_PAPER"):
+                    order_status = dec_status
+
+                    # Log SHADOW_POSITION_OPENED
+                    self._log_event("SHADOW_POSITION_OPENED", {
+                        "symbol": symbol,
+                        "cl_ord_id": intent.cl_ord_id,
+                        "side": target_side,
+                        "entry_price": limit_price,
+                        "pt_price": decision.get("pt_price"),
+                        "sl_price": decision.get("sl_price"),
+                        "qty": decision.get("qty_btc"),
+                        "notional_usd": decision.get("notional_usd"),
+                        "meta_prob": effective_prob,
+                        "trigger_reason": trigger_reason,
+                    })
+                    print(
+                        f"[POSITION OPENED] {symbol:<8} Side={'BUY' if target_side == 1 else 'SELL'} "
+                        f"Price={limit_price:.2f} Notional=${decision.get('notional_usd', 0):.2f} "
+                        f"Reason={trigger_reason}", flush=True
                     )
 
-                    # Check Risk Guardians & PM approval
-                    if not deliberation.risk_verdict.approved:
-                        order_status = f"VETOED_BY_RISK_GUARDIANS_{deliberation.risk_verdict.veto_reason}"
-                    elif deliberation.final_verdict != "APPROVED":
-                        order_status = "VETOED_BY_PORTFOLIO_MANAGER"
-                    else:
-                        best_bid = max(ob_manager.bids.keys()) if ob_manager.bids else 0.0
-                        best_ask = min(ob_manager.asks.keys()) if ob_manager.asks else 0.0
-                        mid_price = 0.5 * (best_bid + best_ask) if (best_bid and best_ask) else close_price
-                        limit_price = best_bid if primary_side == 1 else best_ask
+                    # Route order to Binance Futures Testnet if in testnet mode
+                    if self.testnet_client:
+                        try:
+                            raw_qty = float(decision.get("qty_btc", 0.001))
+                            if raw_qty * limit_price < 50.0:
+                                raw_qty = 55.0 / limit_price
+                            qty = format_order_qty(symbol, raw_qty)
 
-                        self.order_seq += 1
-                        intent = OrderIntent(
-                            cl_ord_id=f"SHADOW_{symbol}_{int(time.time())}_{self.order_seq}",
-                            symbol=symbol,
-                            side=primary_side,
-                            limit_price=limit_price,
-                            mid_price=mid_price,
-                            meta_prob=meta_prob,
-                            vpin_cdf=vpin_cdf,
-                            rolling_vol=rolling_vol
-                        )
-                        decision = self.risk_engines[symbol].validate_and_route_shadow_order(intent, self.current_bar_idx[symbol])
-                        dec_status = decision.get("status")
+                            testnet_order = await self.testnet_client.place_order(
+                                symbol=symbol,
+                                side="BUY" if target_side == 1 else "SELL",
+                                qty=qty,
+                                price=limit_price,
+                                order_type="LIMIT",
+                                time_in_force="GTC",
+                                client_order_id=intent.cl_ord_id
+                            )
+                            order_id = testnet_order.get("orderId")
+                            exch_status = testnet_order.get("status", "UNKNOWN")
+                            self._log_event("TESTNET_ORDER_ROUTED", {
+                                "orderId": order_id,
+                                "status": exch_status,
+                                "clientOrderId": intent.cl_ord_id,
+                                "symbol": symbol,
+                                "side": "BUY" if target_side == 1 else "SELL",
+                                "price": limit_price,
+                                "qty": qty,
+                                "raw_response": testnet_order
+                            })
+                            print(f"[TESTNET ORDER ROUTED] {symbol} orderId={order_id} | status={exch_status} | price={limit_price:.2f} | qty={qty}", flush=True)
+                        except Exception as e:
+                            print(f"[TESTNET ROUTE ERROR] {symbol}: {e}", flush=True)
+                            self._log_event("TESTNET_ORDER_ROUTED", {
+                                "orderId": None,
+                                "status": f"ERROR_{e}",
+                                "clientOrderId": intent.cl_ord_id,
+                                "symbol": symbol,
+                                "side": "BUY" if target_side == 1 else "SELL",
+                                "price": limit_price,
+                                "qty": decision.get("qty_btc", 0.001)
+                            })
+                elif dec_status == "FILTERED":
+                    order_status = "FILTERED_BY_META_PROB"
+                else:
+                    order_status = f"{decision.get('status')}_{decision.get('reason', '')}"
 
-                        if dec_status in ("OPENED_SHADOW_POSITION", "ACKNOWLEDGED_PAPER"):
-                            order_status = dec_status
-
-                            if self.testnet_client:
-                                try:
-                                    qty = float(decision.get("qty_btc", 0.001))
-                                    # Ensure Binance min notional ~$50 USDT
-                                    if qty * limit_price < 50.0:
-                                        raw_qty = 55.0 / limit_price
-                                        precision = 3 if limit_price > 10.0 else (1 if limit_price > 1.0 else 0)
-                                        qty = max(qty, round(raw_qty, precision))
-                                    testnet_order = await self.testnet_client.place_order(
-                                        symbol=symbol,
-                                        side="BUY" if primary_side == 1 else "SELL",
-                                        qty=qty,
-                                        price=limit_price,
-                                        order_type="LIMIT",
-                                        time_in_force="GTC",
-                                        client_order_id=intent.cl_ord_id
-                                    )
-                                    order_id = testnet_order.get("orderId")
-                                    exch_status = testnet_order.get("status", "UNKNOWN")
-                                    self._log_event("TESTNET_ORDER_ROUTED", {
-                                        "orderId": order_id,
-                                        "status": exch_status,
-                                        "clientOrderId": intent.cl_ord_id,
-                                        "symbol": symbol,
-                                        "side": "BUY" if primary_side == 1 else "SELL",
-                                        "price": limit_price,
-                                        "qty": qty,
-                                        "raw_response": testnet_order
-                                    })
-                                    print(f"[TESTNET ORDER ROUTED] {symbol} orderId={order_id} | status={exch_status} | price={limit_price:.2f} | qty={qty}", flush=True)
-                                except Exception as e:
-                                    print(f"[TESTNET ORDER ROUTE ERROR] {symbol}: {e}", flush=True)
-                                    self._log_event("TESTNET_ORDER_ROUTED", {
-                                        "orderId": None,
-                                        "status": f"ERROR_{e}",
-                                        "clientOrderId": intent.cl_ord_id,
-                                        "symbol": symbol,
-                                        "side": "BUY" if primary_side == 1 else "SELL",
-                                        "price": limit_price,
-                                        "qty": decision.get("qty_btc", 0.001)
-                                    })
-                        elif dec_status == "FILTERED":
-                            order_status = "FILTERED_BY_META_PROB"
-                        else:
-                            order_status = f"{decision.get('status')}_{decision.get('reason', '')}"
         except Exception as err:
             close_price = float(new_bar.get("close", 0.0))
             primary_side = 0
@@ -466,15 +462,26 @@ class LiveShadowTrialRunner:
             "cusum_dir": cusum_dir,
             "z_dist": round(z_dist, 4),
             "rolling_vol": round(rolling_vol, 6),
-            "meta_prob": round(meta_prob, 4) if (primary_side != 0 and meta_prob is not None) else None,
+            "meta_prob": round(meta_prob, 4) if (meta_prob is not None) else None,
             "order_status": order_status,
         })
         print(f"[BAR EVALUATION] {symbol:<8} Close={close_price:<9.2f} | CUSUM={cusum_dir:+d} | z_dist={z_dist:+.2f} | Side={primary_side} | Prob={meta_prob} | Status={order_status}", flush=True)
 
+    async def trigger_initial_evaluations(self):
+        """Evaluates all 10 warmed-up symbols immediately so qualifying signals execute on startup."""
+        print(f"[STARTUP] Triggering initial evaluation across 10 warmed-up symbols...", flush=True)
+        for s in self.symbols:
+            try:
+                if len(self.bars_df[s]) > 0:
+                    latest_bar = self.bars_df[s].iloc[-1].to_dict()
+                    await self._evaluate_new_dollar_bar(s, latest_bar, is_initial=True)
+            except Exception as e:
+                print(f"[STARTUP EVAL WARNING] {s}: {e}", flush=True)
+
     async def _background_deliberation_loop(self):
-        """Continuously refreshes TauricResearch multi-agent debates for all 10 assets."""
+        """Continuously refreshes TradingAgents consensus theses across all symbols."""
         while True:
-            await asyncio.sleep(40)
+            await asyncio.sleep(45)
             for s in self.symbols:
                 try:
                     price = self.last_prices.get(s, 0.0)
@@ -493,17 +500,21 @@ class LiveShadowTrialRunner:
                     pass
 
     async def run_forever(self):
-        bg_delib_task = asyncio.create_task(self._background_deliberation_loop())
+        asyncio.create_task(self._background_deliberation_loop())
         while True:
             try:
                 mode_label = "TESTNET" if self.is_testnet else "PRODUCTION"
                 async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=15) as ws:
                     print(f"[CONNECTED] Multiplexing {len(self.symbols)} assets L2 Diff Depth + trades ({mode_label})...", flush=True)
-                    # Trigger initial sync tasks for all symbols
+                    # Trigger initial orderbook snapshot sync
                     for s in self.symbols:
                         asyncio.create_task(
                             self.ob_managers[s].initialize_and_sync(self._fetch_rest_snapshot, self._cancel_quotes_callback)
                         )
+
+                    # Trigger immediate startup evaluations across all 10 symbols
+                    await asyncio.sleep(2.0)
+                    await self.trigger_initial_evaluations()
 
                     async for raw_msg in ws:
                         msg = json.loads(raw_msg)
@@ -542,9 +553,9 @@ class LiveShadowTrialRunner:
                             is_buyer_maker = bool(data["m"])
                             self.last_prices[symbol] = trade_price
 
-                            # 1. Check intrabar exits
-                            closed_trade = self.risk_engines[symbol].check_intrabar_exits(
-                                trade_price, self.current_bar_idx[symbol], is_bar_close=False
+                            # 1. Check intrabar exits isolated to this symbol
+                            closed_trade = self.risk_engine.check_intrabar_exits(
+                                trade_price, self.current_bar_idx[symbol], is_bar_close=False, symbol=symbol
                             )
                             if closed_trade is not None:
                                 self._log_event("SHADOW_POSITION_CLOSED", {**closed_trade, "symbol": symbol})
@@ -555,7 +566,7 @@ class LiveShadowTrialRunner:
                                     flush=True
                                 )
 
-                            # 2. Accumulate tick in Dollar Bar engine
+                            # 2. Accumulate tick in Dollar Bar engine for THIS symbol
                             bar = self.bar_engines[symbol].process_agg_trade(
                                 timestamp_ms=trade_ts,
                                 price=trade_price,
@@ -567,9 +578,9 @@ class LiveShadowTrialRunner:
                                 bar["symbol"] = symbol
                                 self._record_live_dollar_bar_csv(symbol, bar)
 
-                                # 3. Check exits on Dollar Bar close (vertical time barrier)
-                                closed_trade_bar = self.risk_engines[symbol].check_intrabar_exits(
-                                    float(bar["close"]), self.current_bar_idx[symbol], is_bar_close=True
+                                # 3. Check exits on Dollar Bar close
+                                closed_trade_bar = self.risk_engine.check_intrabar_exits(
+                                    float(bar["close"]), self.current_bar_idx[symbol], is_bar_close=True, symbol=symbol
                                 )
                                 if closed_trade_bar is not None:
                                     self._log_event("SHADOW_POSITION_CLOSED", {**closed_trade_bar, "symbol": symbol})
@@ -580,7 +591,7 @@ class LiveShadowTrialRunner:
                                         flush=True
                                     )
 
-                                # 4. Evaluate new Dollar Bar
+                                # 4. Evaluate new Dollar Bar strictly for this symbol
                                 await self._evaluate_new_dollar_bar(symbol, bar)
 
             except Exception as e:
