@@ -33,6 +33,50 @@ for ep in ENV_PATHS:
         break
 
 
+DEFAULT_UNIVERSE = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+    "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT"
+]
+
+QTY_PRECISIONS = {
+    "BTCUSDT": 3,
+    "ETHUSDT": 3,
+    "SOLUSDT": 2,
+    "BNBUSDT": 2,
+    "XRPUSDT": 1,
+    "ADAUSDT": 0,
+    "DOGEUSDT": 0,
+    "AVAXUSDT": 0,
+    "DOTUSDT": 1,
+    "LINKUSDT": 2,
+}
+
+PRICE_PRECISIONS = {
+    "BTCUSDT": 2,
+    "ETHUSDT": 2,
+    "SOLUSDT": 4,
+    "BNBUSDT": 3,
+    "XRPUSDT": 4,
+    "ADAUSDT": 5,
+    "DOGEUSDT": 6,
+    "AVAXUSDT": 4,
+    "DOTUSDT": 6,
+    "LINKUSDT": 3,
+}
+
+
+def format_order_qty(symbol: str, raw_qty: float) -> str:
+    prec = QTY_PRECISIONS.get(symbol.upper(), 2)
+    if prec == 0:
+        return str(int(round(raw_qty)))
+    return f"{raw_qty:.{prec}f}"
+
+
+def format_order_price(symbol: str, raw_price: float) -> str:
+    prec = PRICE_PRECISIONS.get(symbol.upper(), 2)
+    return f"{raw_price:.{prec}f}"
+
+
 class BinanceFuturesTestnetClient:
     """
     Async client for Binance Futures Testnet (fapi).
@@ -173,14 +217,19 @@ class BinanceFuturesTestnetClient:
         self,
         symbol: str = "BTCUSDT",
         side: Union[str, int] = "BUY",
-        qty: float = 0.001,
+        qty: Union[float, str] = 0.001,
         price: Optional[float] = None,
         order_type: str = "LIMIT",
         time_in_force: str = "GTC",
         client_order_id: Optional[str] = None,
+        reduce_only: bool = False,
+        rolling_vol: Optional[float] = None,
+        attach_native_tp_sl: bool = False,
     ) -> Dict[str, Any]:
         """
         Routes an order to Binance Futures Testnet via POST /fapi/v1/order.
+        Optionally submits exchange-native STOP_MARKET and TAKE_PROFIT_MARKET orders
+        with closePosition=true and links order IDs to primary order result.
         """
         if not self.is_time_synced:
             await self.sync_server_time()
@@ -190,13 +239,17 @@ class BinanceFuturesTestnetClient:
 
         side_str = "BUY" if side in (1, "1", "BUY", "buy") else "SELL"
         order_type_str = order_type.upper()
+        qty_str = format_order_qty(symbol, float(qty)) if isinstance(qty, (int, float)) else str(qty)
 
         params: Dict[str, Any] = {
             "symbol": symbol.upper(),
             "side": side_str,
             "type": order_type_str,
-            "quantity": f"{qty:.3f}",
+            "quantity": qty_str,
         }
+
+        if reduce_only:
+            params["reduceOnly"] = "true"
 
         if client_order_id:
             params["newClientOrderId"] = client_order_id
@@ -204,7 +257,7 @@ class BinanceFuturesTestnetClient:
         if order_type_str == "LIMIT":
             if price is None:
                 raise ValueError("Limit orders require a valid price parameter.")
-            params["price"] = f"{price:.2f}"
+            params["price"] = format_order_price(symbol, float(price))
             params["timeInForce"] = time_in_force
 
         signed_params = self._sign_payload(params)
@@ -213,11 +266,171 @@ class BinanceFuturesTestnetClient:
         headers = self._get_headers()
 
         async with session.post(url, headers=headers) as resp:
-            return await resp.json()
+            primary_res = await resp.json()
+
+        # If requested and primary order succeeded/placed, submit exchange-native TP & SL
+        if attach_native_tp_sl and price is not None:
+            eff_vol = max(rolling_vol or 0.0020, 0.0010)
+            tp_sl_res = await self.submit_native_tp_sl(
+                symbol=symbol,
+                side=side_str,
+                entry_price=float(price),
+                rolling_vol=eff_vol
+            )
+            if isinstance(primary_res, dict):
+                primary_res["native_tp_sl"] = tp_sl_res
+                primary_res["sl_order_id"] = tp_sl_res.get("sl_order_id")
+                primary_res["tp_order_id"] = tp_sl_res.get("tp_order_id")
+                primary_res["pt_price"] = tp_sl_res.get("pt_price")
+                primary_res["sl_price"] = tp_sl_res.get("sl_price")
+
+        return primary_res
+
+    async def submit_native_tp_sl(
+        self,
+        symbol: str,
+        side: Union[str, int],
+        entry_price: float,
+        rolling_vol: float = 0.0020,
+    ) -> Dict[str, Any]:
+        """
+        Submits exchange-native Stop Loss (STOP_MARKET) and Take Profit (TAKE_PROFIT_MARKET)
+        orders with closePosition=true on Binance Futures Testnet.
+        """
+        if not self.is_time_synced:
+            await self.sync_server_time()
+
+        side_str = "BUY" if side in (1, "1", "BUY", "buy") else "SELL"
+        counter_side = "SELL" if side_str == "BUY" else "BUY"
+        eff_vol = max(rolling_vol, 0.0010)
+
+        if side_str == "BUY":
+            pt_price = entry_price * (1.0 + 1.5 * eff_vol)
+            sl_price = entry_price * (1.0 - 1.5 * eff_vol)
+        else:
+            pt_price = entry_price * (1.0 - 1.5 * eff_vol)
+            sl_price = entry_price * (1.0 + 1.5 * eff_vol)
+
+        pt_str = format_order_price(symbol, pt_price)
+        sl_str = format_order_price(symbol, sl_price)
+
+        session = await self._get_session()
+        headers = self._get_headers()
+
+        # 1. Stop Loss: STOP_MARKET with closePosition=true via Algo Order API
+        sl_params = self._sign_payload({
+            "algoType": "CONDITIONAL",
+            "symbol": symbol.upper(),
+            "side": counter_side,
+            "type": "STOP_MARKET",
+            "triggerPrice": sl_str,
+            "closePosition": "true",
+            "workingType": "MARK_PRICE",
+        })
+        sl_url = f"{self.base_url}/fapi/v1/algoOrder?{urlencode(sl_params)}"
+        sl_res = None
+        try:
+            async with session.post(sl_url, headers=headers) as resp:
+                sl_res = await resp.json()
+                logger.info("Submitted native SL for %s @ %s: %s", symbol, sl_str, sl_res)
+        except Exception as e:
+            logger.error("Error submitting native SL for %s: %s", symbol, e)
+            sl_res = {"error": str(e)}
+
+        # 2. Take Profit: TAKE_PROFIT_MARKET with closePosition=true via Algo Order API
+        tp_params = self._sign_payload({
+            "algoType": "CONDITIONAL",
+            "symbol": symbol.upper(),
+            "side": counter_side,
+            "type": "TAKE_PROFIT_MARKET",
+            "triggerPrice": pt_str,
+            "closePosition": "true",
+            "workingType": "MARK_PRICE",
+        })
+        tp_url = f"{self.base_url}/fapi/v1/algoOrder?{urlencode(tp_params)}"
+        tp_res = None
+        try:
+            async with session.post(tp_url, headers=headers) as resp:
+                tp_res = await resp.json()
+                logger.info("Submitted native TP for %s @ %s: %s", symbol, pt_str, tp_res)
+        except Exception as e:
+            logger.error("Error submitting native TP for %s: %s", symbol, e)
+            tp_res = {"error": str(e)}
+
+        sl_id = sl_res.get("algoId") or sl_res.get("orderId") if isinstance(sl_res, dict) else None
+        tp_id = tp_res.get("algoId") or tp_res.get("orderId") if isinstance(tp_res, dict) else None
+
+        return {
+            "symbol": symbol.upper(),
+            "pt_price": float(pt_str),
+            "sl_price": float(sl_str),
+            "sl_order_id": sl_id,
+            "tp_order_id": tp_id,
+            "sl_response": sl_res,
+            "tp_response": tp_res,
+        }
+
+    async def flatten_all_positions(self, symbols: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        1. Queries /fapi/v2/positionRisk for all positions with abs(positionAmt) > 0.
+        2. Sends counter MARKET orders with reduceOnly=true to close all open positions.
+        3. Calls cancel_all_open_orders(symbol) for every symbol in universe.
+        """
+        if not self.is_time_synced:
+            await self.sync_server_time()
+
+        universe = symbols or DEFAULT_UNIVERSE
+        positions = await self.get_position_risk()
+        active_positions = [
+            p for p in positions
+            if abs(float(p.get("positionAmt", 0.0))) > 0
+        ]
+
+        results = []
+        session = await self._get_session()
+        headers = self._get_headers()
+
+        for p in active_positions:
+            sym = p.get("symbol", "").upper()
+            amt = float(p.get("positionAmt", 0.0))
+            if amt == 0:
+                continue
+
+            counter_side = "SELL" if amt > 0 else "BUY"
+            qty_str = format_order_qty(sym, abs(amt))
+            logger.info("Flattening %s position: %s %s", sym, counter_side, qty_str)
+
+            params = self._sign_payload({
+                "symbol": sym,
+                "side": counter_side,
+                "type": "MARKET",
+                "quantity": qty_str,
+                "reduceOnly": "true",
+            })
+            url = f"{self.base_url}/fapi/v1/order?{urlencode(params)}"
+
+            try:
+                async with session.post(url, headers=headers) as resp:
+                    res = await resp.json()
+                    logger.info("Flatten response for %s: %s", sym, res)
+                    results.append({"symbol": sym, "side": counter_side, "qty": qty_str, "response": res})
+            except Exception as e:
+                logger.error("Error flattening %s: %s", sym, e)
+                results.append({"symbol": sym, "error": str(e)})
+
+        # Sweep cancel all resting open orders
+        for sym in universe:
+            try:
+                c_res = await self.cancel_all_open_orders(sym)
+                results.append({"symbol": sym, "action": "CANCEL_ORDERS", "response": c_res})
+            except Exception as e:
+                results.append({"symbol": sym, "action": "CANCEL_ORDERS", "error": str(e)})
+
+        return results
 
     async def cancel_all_open_orders(self, symbol: str = "BTCUSDT") -> Dict[str, Any]:
         """
-        Cancels all active resting quotes on Binance Futures Testnet via DELETE /fapi/v1/allOpenOrders.
+        Cancels all active resting quotes and algorithmic TP/SL orders on Binance Futures Testnet.
         """
         if not self.is_time_synced:
             await self.sync_server_time()
@@ -225,13 +438,39 @@ class BinanceFuturesTestnetClient:
         if not self.api_key or not self.api_secret:
             raise ValueError("API credentials required for cancel_all_open_orders.")
 
-        params = self._sign_payload({"symbol": symbol.upper()})
         session = await self._get_session()
-        url = f"{self.base_url}/fapi/v1/allOpenOrders?{urlencode(params)}"
         headers = self._get_headers()
 
-        async with session.delete(url, headers=headers) as resp:
-            return await resp.json()
+        # 1. Cancel standard open orders
+        params = self._sign_payload({"symbol": symbol.upper()})
+        url = f"{self.base_url}/fapi/v1/allOpenOrders?{urlencode(params)}"
+        std_res = {}
+        try:
+            async with session.delete(url, headers=headers) as resp:
+                std_res = await resp.json()
+        except Exception as e:
+            std_res = {"error": str(e)}
+
+        # 2. Cancel open algorithmic TP/SL orders
+        algo_cancelled = []
+        try:
+            q_params = self._sign_payload({"symbol": symbol.upper()})
+            q_url = f"{self.base_url}/fapi/v1/openAlgoOrders?{urlencode(q_params)}"
+            async with session.get(q_url, headers=headers) as aresp:
+                algo_orders = await aresp.json()
+                if isinstance(algo_orders, list):
+                    for ao in algo_orders:
+                        aid = ao.get("algoId")
+                        if aid:
+                            d_params = self._sign_payload({"symbol": symbol.upper(), "algoId": aid})
+                            d_url = f"{self.base_url}/fapi/v1/algoOrder?{urlencode(d_params)}"
+                            async with session.delete(d_url, headers=headers) as dresp:
+                                d_data = await dresp.json()
+                                algo_cancelled.append(d_data)
+        except Exception as ae:
+            logger.warning("Error cancelling algo orders for %s: %s", symbol, ae)
+
+        return {"standard": std_res, "algo_cancelled": algo_cancelled}
 
     async def cancel_order(self, symbol: str, order_id: int) -> Dict[str, Any]:
         """
@@ -338,7 +577,7 @@ class BinanceFuturesTestnetClient:
 
     async def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """
-        Fetches currently active open orders via GET /fapi/v1/openOrders.
+        Fetches currently active open orders and algo orders via GET /fapi/v1/openOrders and /fapi/v1/openAlgoOrders.
         """
         if not self.is_time_synced:
             await self.sync_server_time()
@@ -349,18 +588,38 @@ class BinanceFuturesTestnetClient:
         payload = {"symbol": symbol.upper()} if symbol else {}
         params = self._sign_payload(payload)
         session = await self._get_session()
-        url = f"{self.base_url}/fapi/v1/openOrders?{urlencode(params)}"
         headers = self._get_headers()
 
+        all_orders = []
         try:
+            url = f"{self.base_url}/fapi/v1/openOrders?{urlencode(params)}"
             async with session.get(url, headers=headers) as resp:
                 data = await resp.json()
                 if isinstance(data, list):
-                    return data
-                return []
+                    all_orders.extend(data)
         except Exception as e:
             logger.error("Error fetching openOrders: %s", e)
-            return []
+
+        try:
+            algo_url = f"{self.base_url}/fapi/v1/openAlgoOrders?{urlencode(params)}"
+            async with session.get(algo_url, headers=headers) as resp:
+                algo_data = await resp.json()
+                if isinstance(algo_data, list):
+                    for ao in algo_data:
+                        all_orders.append({
+                            "orderId": ao.get("algoId"),
+                            "symbol": ao.get("symbol"),
+                            "side": ao.get("side"),
+                            "type": ao.get("orderType"),
+                            "stopPrice": ao.get("triggerPrice"),
+                            "price": ao.get("price"),
+                            "closePosition": ao.get("closePosition"),
+                            "is_algo": True,
+                        })
+        except Exception as ae:
+            logger.error("Error fetching openAlgoOrders: %s", ae)
+
+        return all_orders
 
     async def close(self) -> None:
         """Closes the underlying aiohttp ClientSession."""

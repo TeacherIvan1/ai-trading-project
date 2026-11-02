@@ -409,14 +409,8 @@ class LiveShadowTrialRunner:
                     # Route order to Binance Futures Testnet if in testnet mode
                     if self.testnet_client:
                         try:
-                            # 1. Enforce Programmatic Leverage & Margin Type (Capped strictly at 3x max)
+                            # 1. Enforce Programmatic Leverage & Margin Type (Capped strictly at 2x max)
                             rec_lev = 2
-                            if deliberation and hasattr(deliberation, "proposal") and deliberation.proposal:
-                                try:
-                                    rec_lev = int(round(deliberation.proposal.recommended_leverage))
-                                except Exception:
-                                    rec_lev = 2
-                            rec_lev = max(1, min(rec_lev, 3))
 
                             try:
                                 await self.testnet_client.set_margin_type(symbol, "ISOLATED")
@@ -424,9 +418,9 @@ class LiveShadowTrialRunner:
                             except Exception as le:
                                 print(f"[TESTNET] Margin/leverage config for {symbol}: {le}", flush=True)
 
-                            # 2. Portfolio Capital Cap & Sizing Governor (Max 10% notional per single position)
+                            # 2. Portfolio Capital Cap & Sizing Governor (Max $1,000 USDT notional, max 10% equity)
                             raw_qty = float(decision.get("qty_btc", 0.001))
-                            max_single_notional = self.risk_engine.equity * 0.10
+                            max_single_notional = min(1000.0, self.risk_engine.equity * 0.10)
                             if raw_qty * limit_price > max_single_notional:
                                 raw_qty = max_single_notional / limit_price
                             if raw_qty * limit_price < 50.0:
@@ -440,10 +434,16 @@ class LiveShadowTrialRunner:
                                 price=limit_price,
                                 order_type="LIMIT",
                                 time_in_force="GTC",
-                                client_order_id=intent.cl_ord_id
+                                client_order_id=intent.cl_ord_id,
+                                attach_native_tp_sl=True,
+                                rolling_vol=rolling_vol,
                             )
                             order_id = testnet_order.get("orderId")
                             exch_status = testnet_order.get("status", "UNKNOWN")
+                            sl_order_id = testnet_order.get("sl_order_id")
+                            tp_order_id = testnet_order.get("tp_order_id")
+                            pt_price = testnet_order.get("pt_price")
+                            sl_price = testnet_order.get("sl_price")
                             self._log_event("TESTNET_ORDER_ROUTED", {
                                 "orderId": order_id,
                                 "status": exch_status,
@@ -454,9 +454,13 @@ class LiveShadowTrialRunner:
                                 "qty": qty,
                                 "leverage": rec_lev,
                                 "margin_type": "ISOLATED",
+                                "slOrderId": sl_order_id,
+                                "tpOrderId": tp_order_id,
+                                "ptPrice": pt_price,
+                                "slPrice": sl_price,
                                 "raw_response": testnet_order
                             })
-                            print(f"[TESTNET ORDER ROUTED] {symbol} orderId={order_id} | status={exch_status} | price={limit_price:.2f} | qty={qty} | lev={rec_lev}x [ISOLATED]", flush=True)
+                            print(f"[TESTNET ORDER ROUTED] {symbol} orderId={order_id} (TP={tp_order_id}, SL={sl_order_id}) | status={exch_status} | price={limit_price:.2f} | qty={qty} | lev={rec_lev}x [ISOLATED]", flush=True)
                         except Exception as e:
                             print(f"[TESTNET ROUTE ERROR] {symbol}: {e}", flush=True)
                             self._log_event("TESTNET_ORDER_ROUTED", {
@@ -584,11 +588,13 @@ class LiveShadowTrialRunner:
                 except Exception as me:
                     print(f"[TESTNET INIT] Margin/leverage warning on {s}: {me}", flush=True)
 
+        reconnect_delay = 1.0
         while True:
             try:
                 mode_label = "TESTNET" if self.is_testnet else "PRODUCTION"
                 async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=15) as ws:
                     print(f"[CONNECTED] Multiplexing {len(self.symbols)} assets L2 Diff Depth + trades ({mode_label})...", flush=True)
+                    reconnect_delay = 1.0
                     # Trigger initial orderbook snapshot sync
                     for s in self.symbols:
                         asyncio.create_task(
@@ -682,8 +688,13 @@ class LiveShadowTrialRunner:
                                 await self._evaluate_new_dollar_bar(symbol, bar)
 
             except Exception as e:
-                self._log_event("WS_RECONNECT", {"error": str(e)})
-                await asyncio.sleep(2.0)
+                self._log_event("WS_RECONNECT_ATTEMPT", {
+                    "error": str(e),
+                    "backoff_seconds": reconnect_delay
+                })
+                print(f"[WS RECONNECT ATTEMPT] {e}. Backing off for {reconnect_delay:.1f}s...", flush=True)
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(30.0, reconnect_delay * 1.5)
 
 
 def main():

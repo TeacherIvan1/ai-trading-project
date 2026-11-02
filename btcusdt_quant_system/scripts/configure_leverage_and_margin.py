@@ -46,3 +46,4 @@ async def configure_symbols():
 
 if __name__ == "__main__":
     asyncio.run(configure_symbols())
+

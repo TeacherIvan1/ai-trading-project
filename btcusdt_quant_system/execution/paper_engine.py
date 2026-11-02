@@ -103,8 +103,8 @@ class SynchronousPreTradeRiskAndPaperEngine:
         if intent.symbol in self.active_positions:
             return {"status": "SKIPPED", "reason": f"POSITION_ALREADY_OPEN_FOR_{intent.symbol}"}
 
-        # 0b. Maximum concurrent open positions check (strict cap of 4 assets)
-        if len(self.active_positions) >= 4:
+        # 0b. Maximum concurrent open positions check (strict cap of 3 assets)
+        if len(self.active_positions) >= 3:
             return {"status": "FILTERED", "reason": "MAX_CONCURRENT_POSITIONS_REACHED"}
 
         # 1. Out-of-band Kill Switch Check
@@ -126,9 +126,9 @@ class SynchronousPreTradeRiskAndPaperEngine:
                 return {"status": "FILTERED", "reason": f"LOW_META_PROB ({prob_str} < 0.56)"}
 
         # 3b. Strict Single Position & Portfolio Capital Governors:
-        # - Max single position notional: 10% of total equity (~$1,300 USDT max)
+        # - Max single position notional: capped strictly at min($1,000 USDT, 10% of total equity)
         # - Max total portfolio notional: 40% of total equity
-        max_single_notional = self.equity * 0.10
+        max_single_notional = min(1000.0, self.equity * 0.10)
         current_total_notional = sum(p.notional_usd for p in self.active_positions.values())
         max_total_notional = self.equity * 0.40
 
