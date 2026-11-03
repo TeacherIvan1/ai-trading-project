@@ -133,26 +133,41 @@ def get_daemon_status() -> Dict[str, Any]:
     if now - daemon_status_cache["last_check"] < 2.0:
         return daemon_status_cache["status"]
 
-    # 4. Fallback to PowerShell CIM query
-    try:
-        cmd = [
-            "powershell",
-            "-NoProfile",
-            "-Command",
-            "Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" | Where-Object { $_.CommandLine -like '*main_shadow_trial.py*' } | Select-Object -ExpandProperty ProcessId"
-        ]
-        out = subprocess.check_output(cmd, text=True, timeout=3.0).strip()
-        if out:
-            pids = [int(p) for p in out.splitlines() if p.strip().isdigit()]
-            if pids:
-                if bot_start_time is None:
-                    bot_start_time = time.time()
-                status = {"running": True, "pid": pids[0]}
-                daemon_status_cache["status"] = status
-                daemon_status_cache["last_check"] = now
-                return status
-    except Exception:
-        pass
+    # 4. Fallback process query (Windows powershell or Linux pgrep)
+    if sys.platform == "win32":
+        try:
+            cmd = [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" | Where-Object { $_.CommandLine -like '*main_shadow_trial.py*' } | Select-Object -ExpandProperty ProcessId"
+            ]
+            out = subprocess.check_output(cmd, text=True, timeout=3.0).strip()
+            if out:
+                pids = [int(p) for p in out.splitlines() if p.strip().isdigit()]
+                if pids:
+                    if bot_start_time is None:
+                        bot_start_time = time.time()
+                    status = {"running": True, "pid": pids[0]}
+                    daemon_status_cache["status"] = status
+                    daemon_status_cache["last_check"] = now
+                    return status
+        except Exception:
+            pass
+    else:
+        try:
+            out = subprocess.check_output(["pgrep", "-f", "main_shadow_trial.py"], text=True, timeout=3.0).strip()
+            if out:
+                pids = [int(p) for p in out.splitlines() if p.strip().isdigit() and int(p) != os.getpid()]
+                if pids:
+                    if bot_start_time is None:
+                        bot_start_time = time.time()
+                    status = {"running": True, "pid": pids[0]}
+                    daemon_status_cache["status"] = status
+                    daemon_status_cache["last_check"] = now
+                    return status
+        except Exception:
+            pass
 
     bot_start_time = None
     status = {"running": False, "pid": None}
@@ -366,7 +381,10 @@ async def stop_bot():
 
     if status["running"] and status["pid"]:
         try:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(status["pid"])], capture_output=True, timeout=3.0)
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(status["pid"])], capture_output=True, timeout=3.0)
+            else:
+                os.kill(status["pid"], 9)
             killed = True
         except Exception:
             pass
