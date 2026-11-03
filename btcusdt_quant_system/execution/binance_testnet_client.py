@@ -314,11 +314,30 @@ class BinanceFuturesTestnetClient:
             pt_price = entry_price * (1.0 - 1.5 * eff_vol)
             sl_price = entry_price * (1.0 + 1.5 * eff_vol)
 
-        pt_str = format_order_price(symbol, pt_price)
-        sl_str = format_order_price(symbol, sl_price)
-
         session = await self._get_session()
         headers = self._get_headers()
+
+        # Check current mark price to avoid -2021 "Order would immediately trigger"
+        try:
+            async with session.get(f"{self.base_url}/fapi/v1/premiumIndex?symbol={symbol.upper()}") as mp_resp:
+                mp_data = await mp_resp.json()
+                mark_p = float(mp_data.get("markPrice", 0.0))
+                if mark_p > 0.0:
+                    if side_str == "BUY":
+                        if sl_price >= mark_p:
+                            sl_price = mark_p * 0.985
+                        if pt_price <= mark_p:
+                            pt_price = mark_p * 1.015
+                    else:
+                        if sl_price <= mark_p:
+                            sl_price = mark_p * 1.015
+                        if pt_price >= mark_p:
+                            pt_price = mark_p * 0.985
+        except Exception:
+            pass
+
+        pt_str = format_order_price(symbol, pt_price)
+        sl_str = format_order_price(symbol, sl_price)
 
         # 1. Stop Loss: STOP_MARKET with closePosition=true
         sl_params = self._sign_payload({

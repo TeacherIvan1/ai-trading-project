@@ -40,11 +40,12 @@ async def main():
     client = BinanceFuturesTestnetClient()
     await client.sync_server_time()
 
+    prot_symbols = active_in_pos if active_in_pos else ["BTCUSDT", "ETHUSDT", "DOGEUSDT", "DOTUSDT"]
     prot_orders = []
-    for s in PROTECTED_SYMBOLS:
+    for s in prot_symbols:
         orders = await client.get_open_orders(s)
         for o in orders:
-            if o.get("type") in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+            if o.get("type") in ("STOP_MARKET", "TAKE_PROFIT_MARKET") or o.get("orderType") in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
                 prot_orders.append(o)
 
     print("\n" + "=" * 90)

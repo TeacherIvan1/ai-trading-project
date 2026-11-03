@@ -18,7 +18,7 @@ async def main():
     for p in positions:
         sym = p.get("symbol")
         amt = float(p.get("positionAmt", 0.0))
-        if sym in TARGET_SYMBOLS and abs(amt) > 0:
+        if abs(amt) > 0:
             target_positions[sym] = {
                 "amt": amt,
                 "entry_price": float(p.get("entryPrice", 0.0)),
@@ -30,12 +30,7 @@ async def main():
 
     print("\n[2] Submitting missing STOP_MARKET and TAKE_PROFIT_MARKET orders...")
     results = {}
-    for sym in TARGET_SYMBOLS:
-        pos = target_positions.get(sym)
-        if not pos:
-            print(f"  Warning: No active position for {sym}, using reference fallback.")
-            continue
-            
+    for sym, pos in target_positions.items():
         print(f"  Submitting TP/SL for {sym} (side={pos['side']}, entry={pos['entry_price']})...")
         res = await client.place_tp_sl_orders(
             symbol=sym,
@@ -49,7 +44,7 @@ async def main():
 
     print("\n[3] Querying active open orders across target symbols...")
     total_orders = []
-    for sym in TARGET_SYMBOLS:
+    for sym in target_positions.keys():
         orders = await client.get_open_orders(sym)
         for o in orders:
             total_orders.append(o)

@@ -318,9 +318,9 @@ class LiveShadowTrialRunner:
                             entry_bar_idx=0,
                             pt_price=pt_p,
                             sl_price=sl_p,
-                            stall_bar_idx=10,
+                            stall_bar_idx=999999,
                             stall_min_ret=0.001,
-                            max_bar_idx=40,
+                            max_bar_idx=999999,
                             meta_prob=0.70,
                             entry_ts_ms=int(time.time() * 1000)
                         )
@@ -729,7 +729,13 @@ class LiveShadowTrialRunner:
                             )
                             if closed_trade is not None:
                                 self._log_event("SHADOW_POSITION_CLOSED", {**closed_trade, "symbol": symbol})
-                                if self.testnet_client:
+                                trading_agents_pipeline.settle_position(
+                                    symbol=symbol,
+                                    exit_pnl=float(closed_trade.get("pnl_usd", 0.0)),
+                                    exit_reason=str(closed_trade.get("exit_reason", "INTRABAR_EXIT")),
+                                    net_return_bps=float(closed_trade.get("net_return_bps", 0.0)),
+                                )
+                                if self.testnet_client and symbol not in self.open_positions:
                                     asyncio.create_task(self.testnet_client.cancel_all_open_orders(symbol))
                                 print(
                                     f"[TRADE CLOSED (INTRABAR)] Symbol={symbol} Reason={closed_trade['exit_reason']} | "
@@ -756,7 +762,13 @@ class LiveShadowTrialRunner:
                                 )
                                 if closed_trade_bar is not None:
                                     self._log_event("SHADOW_POSITION_CLOSED", {**closed_trade_bar, "symbol": symbol})
-                                    if self.testnet_client:
+                                    trading_agents_pipeline.settle_position(
+                                        symbol=symbol,
+                                        exit_pnl=float(closed_trade_bar.get("pnl_usd", 0.0)),
+                                        exit_reason=str(closed_trade_bar.get("exit_reason", "BAR_CLOSE_EXIT")),
+                                        net_return_bps=float(closed_trade_bar.get("net_return_bps", 0.0)),
+                                    )
+                                    if self.testnet_client and symbol not in self.open_positions:
                                         asyncio.create_task(self.testnet_client.cancel_all_open_orders(symbol))
                                     print(
                                         f"[TRADE CLOSED (BAR CLOSE)] Symbol={symbol} Reason={closed_trade_bar['exit_reason']} | "

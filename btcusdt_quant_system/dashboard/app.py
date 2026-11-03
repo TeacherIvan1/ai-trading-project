@@ -32,7 +32,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from execution.binance_testnet_client import BinanceFuturesTestnetClient
-from agents.trading_agents_bridge import trading_agents_pipeline
+from agents.trading_agents_bridge import trading_agents_pipeline, build_portfolio_context
 
 app = FastAPI(title="Crypto Quant Engine // Terminal & TradingAgents")
 
@@ -400,6 +400,47 @@ async def on_startup():
     asyncio.create_task(bot_watchdog_loop())
 
 
+@app.get("/api/report/{symbol}", response_class=HTMLResponse)
+async def get_agent_report(symbol: str = "BTCUSDT"):
+    """
+    Renders a standalone, institutional-grade single-page HTML deliberation report
+    matching complete_report.html from TauricResearch/TradingAgents.
+    """
+    target_symbol = symbol.strip().upper() if symbol else "BTCUSDT"
+    if target_symbol not in DEFAULT_UNIVERSE:
+        target_symbol = "BTCUSDT"
+
+    bal = await get_cached_testnet_balance()
+    live_testnet_positions = await get_cached_testnet_positions()
+    portfolio_ctx = build_portfolio_context(bal["total_balance"], live_testnet_positions)
+    audit_data = parse_audit_log_data(200)
+    ev = audit_data["evaluations"].get(target_symbol, {})
+    bars = parse_tail_dollar_bars(5, target_symbol=target_symbol)
+    latest_bar = bars[-1] if bars else {}
+    close_price = float(ev.get("close_price", latest_bar.get("close", REF_PRICES.get(target_symbol, 100.0))))
+    rolling_vol = float(ev.get("rolling_vol", 0.0015))
+    cusum_dir = int(ev.get("cusum_dir", 0))
+    z_dist = float(ev.get("z_dist", 0.0))
+    vpin_cdf = float(ev.get("vpin_cdf", 0.50))
+    net_order_flow = float(latest_bar.get("net_order_flow", 0.0))
+
+    await trading_agents_pipeline.ensure_deliberation(
+        symbol=target_symbol,
+        current_price=close_price,
+        rolling_vol=rolling_vol,
+        cusum_dir=cusum_dir,
+        z_dist=z_dist,
+        vpin_cdf=vpin_cdf,
+        net_order_flow=net_order_flow,
+        open_positions=live_testnet_positions,
+        universe_prices={s: float(audit_data["evaluations"].get(s, {}).get("close_price", REF_PRICES.get(s, 100.0))) for s in DEFAULT_UNIVERSE},
+        testnet_balance=bal["total_balance"],
+        portfolio=portfolio_ctx,
+    )
+    html = trading_agents_pipeline.generate_html_report(target_symbol)
+    return HTMLResponse(content=html)
+
+
 @app.get("/api/state")
 async def get_state(symbol: str = "BTCUSDT"):
     """
@@ -530,8 +571,55 @@ async def get_state(symbol: str = "BTCUSDT"):
             "leverage_badge": "2x [ISOLATED]",
         })
 
-    # 3. Active Cryptos (All 10 Universe Symbols Guaranteed)
+    # 3. Microstructure & Live Pricing (Strictly Filtered by target_symbol)
+    latest_eval = audit_data["evaluations"].get(target_symbol, {})
+    latest_bar = bars[-1] if bars else {}
+    close_price = latest_eval.get("close_price", latest_bar.get("close", REF_PRICES.get(target_symbol, 80000.0)))
+    rolling_vol = latest_eval.get("rolling_vol", 0.00065)
+    cusum_dir = latest_eval.get("cusum_dir", 0)
+    z_dist = latest_eval.get("z_dist", 0.0)
+    vpin = latest_eval.get("vpin", 0.485)
+    vpin_cdf = latest_eval.get("vpin_cdf", 0.52)
+    vpin_near_circuit_breaker = bool(vpin_cdf >= 0.95)
+
+    microstructure = {
+        "symbol": target_symbol,
+        "close_price": round(float(close_price), 4 if close_price < 1.0 else 2),
+        "rolling_vol": round(float(rolling_vol), 6),
+        "cusum_dir": int(cusum_dir),
+        "z_dist": round(float(z_dist), 2),
+        "vpin": round(float(vpin), 4),
+        "vpin_cdf": round(float(vpin_cdf), 4),
+        "vpin_near_circuit_breaker": vpin_near_circuit_breaker,
+    }
+
+    # 4. TauricResearch / TradingAgents Multi-Agent Consensus
+    portfolio_ctx = build_portfolio_context(
+        testnet_balance=bal["total_balance"],
+        open_positions=live_testnet_positions,
+        max_positions=4,
+    )
+    universe_p = {
+        s: float(audit_data["evaluations"].get(s, {}).get("close_price", REF_PRICES.get(s, 100.0)))
+        for s in DEFAULT_UNIVERSE
+    }
+    await trading_agents_pipeline.ensure_deliberation(
+        symbol=target_symbol,
+        current_price=float(close_price),
+        meta_prob=None,
+        rolling_vol=float(rolling_vol),
+        cusum_dir=int(cusum_dir),
+        z_dist=float(z_dist),
+        vpin_cdf=float(vpin_cdf),
+        net_order_flow=float(latest_bar.get("net_order_flow", 0.0)),
+        open_positions=live_testnet_positions,
+        universe_prices=universe_p,
+        testnet_balance=bal["total_balance"],
+        portfolio=portfolio_ctx,
+    )
     debates = trading_agents_pipeline.get_latest_debates()
+
+    # 5. Active Cryptos (All 10 Universe Symbols Guaranteed)
     active_cryptos = []
     for s in DEFAULT_UNIVERSE:
         short_name = s.replace("USDT", "")
@@ -571,28 +659,6 @@ async def get_state(symbol: str = "BTCUSDT"):
             "thesis": thesis,
             "verdict": verdict,
         })
-
-    # 4. Microstructure (Strictly Filtered by target_symbol)
-    latest_eval = audit_data["evaluations"].get(target_symbol, {})
-    latest_bar = bars[-1] if bars else {}
-    close_price = latest_eval.get("close_price", latest_bar.get("close", REF_PRICES.get(target_symbol, 80000.0)))
-    rolling_vol = latest_eval.get("rolling_vol", 0.00065)
-    cusum_dir = latest_eval.get("cusum_dir", 0)
-    z_dist = latest_eval.get("z_dist", 0.0)
-    vpin = latest_eval.get("vpin", 0.485)
-    vpin_cdf = latest_eval.get("vpin_cdf", 0.52)
-    vpin_near_circuit_breaker = bool(vpin_cdf >= 0.95)
-
-    microstructure = {
-        "symbol": target_symbol,
-        "close_price": round(float(close_price), 4 if close_price < 1.0 else 2),
-        "rolling_vol": round(float(rolling_vol), 6),
-        "cusum_dir": int(cusum_dir),
-        "z_dist": round(float(z_dist), 2),
-        "vpin": round(float(vpin), 4),
-        "vpin_cdf": round(float(vpin_cdf), 4),
-        "vpin_near_circuit_breaker": vpin_near_circuit_breaker,
-    }
 
     # 5. Account Metrics
     initial_paper_equity = 2500.00
@@ -665,6 +731,8 @@ async def get_state(symbol: str = "BTCUSDT"):
         "recent_events": audit_data["recent_events"],
         "audit_tail": audit_data["recent_events"],  # Alias for audit table
         "latest_agent_debates": debates,
+        "deliberation": debates.get(target_symbol, {}),
+        "portfolio_context": portfolio_ctx,
         "system_health": system_health,
         "account_metrics": account_metrics,
         "microstructure": microstructure,
@@ -951,6 +1019,9 @@ async def get_dashboard():
         <div class="flex items-center gap-2">
           <span class="inline-block w-2 h-2 rounded-full bg-amber-400 shadow-[0_0_6px_#f59e0b]"></span>
           <h2 class="text-xs font-bold uppercase tracking-wider text-slate-200">TauricResearch / TradingAgents Consensus Terminal</h2>
+          <button onclick="window.open('/api/report/' + selectedAsset, '_blank')" class="ml-2 px-2 py-1 rounded text-[10px] font-sans font-bold bg-cyan-900/60 hover:bg-cyan-800 text-cyan-200 border border-cyan-700/50 flex items-center gap-1 transition cursor-pointer">
+            <span>📄</span> <span>View Full Agent Report</span>
+          </button>
         </div>
         <!-- Asset Selector Tabs -->
         <div id="m2-asset-tabs" class="flex flex-wrap gap-1 font-mono text-[10px]">
