@@ -104,6 +104,7 @@ RestartSec=5
 StandardOutput=append:/home/ubuntu/ai-trading-project/btcusdt_quant_system/logs/daemon.log
 StandardError=append:/home/ubuntu/ai-trading-project/btcusdt_quant_system/logs/daemon_err.log
 Environment=PYTHONUNBUFFERED=1
+Environment="PYTHONPATH=/home/ubuntu/ai-trading-project/btcusdt_quant_system"
 
 [Install]
 WantedBy=multi-user.target
@@ -125,6 +126,7 @@ RestartSec=5
 StandardOutput=append:/home/ubuntu/ai-trading-project/btcusdt_quant_system/logs/uvicorn.log
 StandardError=append:/home/ubuntu/ai-trading-project/btcusdt_quant_system/logs/uvicorn_err.log
 Environment=PYTHONUNBUFFERED=1
+Environment="PYTHONPATH=/home/ubuntu/ai-trading-project/btcusdt_quant_system"
 
 [Install]
 WantedBy=multi-user.target
@@ -163,3 +165,4 @@ echo " Bot Service:  sudo systemctl status quant-bot"
 echo " Dashboard:    sudo systemctl status quant-dashboard"
 echo " Live Logs:    tail -f /home/ubuntu/ai-trading-project/btcusdt_quant_system/logs/daemon.log"
 echo "======================================================================"
+

@@ -13,7 +13,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import List, Dict, Optional, Any, Union, Tuple
 from urllib.parse import urlencode
 
 import aiohttp
