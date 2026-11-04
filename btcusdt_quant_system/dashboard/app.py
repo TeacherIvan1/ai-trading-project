@@ -208,6 +208,32 @@ async def get_cached_testnet_positions() -> List[Dict[str, Any]]:
     return positions_cache["data"]
 
 
+income_cache = {
+    "total_realized_pnl": 0.0,
+    "income_records": [],
+    "last_fetch": 0.0,
+}
+
+
+async def get_cached_realized_income() -> Dict[str, Any]:
+    """Queries BinanceFuturesTestnetClient get_realized_income with a 5-second TTL cache."""
+    now = time.time()
+    if now - income_cache["last_fetch"] > 5.0:
+        try:
+            records = await testnet_client.get_realized_income(limit=100)
+            if records and isinstance(records, list):
+                tot_pnl = sum(float(r.get("income", 0.0)) for r in records if r.get("incomeType") == "REALIZED_PNL")
+                income_cache["total_realized_pnl"] = tot_pnl
+                income_cache["income_records"] = records
+                income_cache["last_fetch"] = now
+        except Exception:
+            income_cache["last_fetch"] = now - 2.0
+    return {
+        "total_realized_pnl": income_cache["total_realized_pnl"],
+        "income_records": income_cache["income_records"],
+    }
+
+
 def parse_audit_log_data(max_tail: int = 5000) -> Dict[str, Any]:
     """
     Scans the tail of shadow_trial_audit.jsonl and extracts:
@@ -473,6 +499,7 @@ async def get_state(symbol: str = "BTCUSDT"):
 
     bal = await get_cached_testnet_balance()
     live_testnet_positions = await get_cached_testnet_positions()
+    income_data = await get_cached_realized_income()
     daemon_info = get_daemon_status()
     audit_data = parse_audit_log_data(5000)
     bars = parse_tail_dollar_bars(60, target_symbol=target_symbol)
@@ -649,8 +676,11 @@ async def get_state(symbol: str = "BTCUSDT"):
 
         # PnL & trade count
         s_closed = [t for t in audit_data["closed_trades"] if t.get("symbol") == s]
-        pnl_realized = sum(float(t.get("pnl_usd", 0.0)) for t in s_closed)
-        in_pos = (s in active_in_position_symbols)
+        if income_data["income_records"]:
+            pnl_realized = sum(float(r.get("income", 0.0)) for r in income_data["income_records"] if r.get("symbol") == s and r.get("incomeType") == "REALIZED_PNL")
+        else:
+            pnl_realized = sum(float(t.get("pnl_usd", 0.0)) for t in s_closed)
+        in_pos = any(p.get("symbol") == s and abs(float(p.get("positionAmt", 0))) > 0 for p in live_testnet_positions) or (s in active_in_position_symbols)
 
         # Deliberation stance
         d = debates.get(s, {})
@@ -680,7 +710,11 @@ async def get_state(symbol: str = "BTCUSDT"):
 
     # 5. Account Metrics
     initial_paper_equity = 2500.00
-    realized_pnl = sum(float(t.get("pnl_usd", 0.0)) for t in audit_data["closed_trades"])
+    if income_data["income_records"]:
+        realized_pnl = float(income_data["total_realized_pnl"])
+    else:
+        realized_pnl = sum(float(t.get("pnl_usd", 0.0)) for t in audit_data["closed_trades"])
+
     paper_equity = initial_paper_equity + realized_pnl
     if audit_data["closed_trades"]:
         paper_equity = float(audit_data["closed_trades"][-1].get("updated_equity", paper_equity))
@@ -692,6 +726,7 @@ async def get_state(symbol: str = "BTCUSDT"):
         max_dd = 0.0
 
     total_net_pnl = realized_pnl + total_unrealized_pnl
+    active_exchange_pos_count = len([p for p in live_testnet_positions if abs(float(p.get("positionAmt", 0))) > 0])
 
     account_metrics = {
         "testnet_equity": bal["total_balance"],
@@ -705,7 +740,7 @@ async def get_state(symbol: str = "BTCUSDT"):
         "net_profit_usd": round(realized_pnl, 2),
         "net_profit_pct": round((realized_pnl / initial_paper_equity) * 100.0, 2),
         "win_rate": win_rate,
-        "open_positions": len(active_in_position_symbols),
+        "open_positions": active_exchange_pos_count if active_exchange_pos_count > 0 else len(active_in_position_symbols),
         "max_drawdown": max_dd,
         "total_trades": len(audit_data["closed_trades"]),
     }

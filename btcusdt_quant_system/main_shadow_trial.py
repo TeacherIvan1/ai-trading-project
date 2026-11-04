@@ -339,13 +339,45 @@ class LiveShadowTrialRunner:
         now_iso = datetime.now(timezone.utc).isoformat()
         if self.testnet_client:
             try:
-                # Protect active TP/SL if symbol is currently in an open position
-                if symbol not in self.risk_engine.active_positions:
-                    print(f"[{now_iso}] [SAFETY] Cancelling resting shadow quotes for {symbol} during L2 resync.", flush=True)
-                    res = await self.testnet_client.cancel_all_open_orders(symbol)
-                    self._log_event("TESTNET_CANCEL_ALL_OPEN_ORDERS", {"symbol": symbol, "result": res})
+                positions = await self.testnet_client.get_position_risk()
+                has_pos = any(p.get("symbol") == symbol and abs(float(p.get("positionAmt", 0.0))) > 0 for p in positions)
+                if has_pos or symbol in self.risk_engine.active_positions:
+                    print(f"[{now_iso}] [SAFETY] Skipping cancel_all_open_orders for {symbol} because position is open.", flush=True)
+                    return
+                print(f"[{now_iso}] [SAFETY] Cancelling resting shadow quotes for {symbol} during L2 resync.", flush=True)
+                res = await self.testnet_client.cancel_all_open_orders(symbol)
+                self._log_event("TESTNET_CANCEL_ALL_OPEN_ORDERS", {"symbol": symbol, "result": res})
             except Exception as e:
                 print(f"[{now_iso}] [TESTNET ERROR] Failed to cancel open orders for {symbol}: {e}", flush=True)
+
+    async def _handle_barrier_exit(self, symbol: str, closed_trade: dict) -> None:
+        """
+        Executes a real reduceOnly MARKET order on Binance Testnet when a barrier triggers,
+        verifies the exchange position is completely flat before logging SHADOW_POSITION_CLOSED,
+        and synchronizes TradingAgents memory.
+        """
+        if self.testnet_client:
+            close_res = await self.testnet_client.close_position_market(symbol)
+            if not close_res.get("closed", False):
+                print(f"[BARRIER EXIT WARNING] Could not confirm position closed on Binance for {symbol}: {close_res}", flush=True)
+                await self.sync_live_exchange_positions()
+                return
+            self.open_positions.pop(symbol, None)
+            closed_trade["exchange_close_res"] = close_res
+
+        self._log_event("SHADOW_POSITION_CLOSED", {**closed_trade, "symbol": symbol})
+        trading_agents_pipeline.settle_position(
+            symbol=symbol,
+            exit_pnl=float(closed_trade.get("pnl_usd", 0.0)),
+            exit_reason=str(closed_trade.get("exit_reason", "BARRIER_EXIT")),
+            net_return_bps=float(closed_trade.get("net_return_bps", 0.0)),
+        )
+        print(
+            f"[TRADE CLOSED ({closed_trade.get('exit_reason')})] Symbol={symbol} | "
+            f"ExitPrice={closed_trade.get('exit_price')} | NetReturn={closed_trade.get('net_return_bps')}bps | "
+            f"PnL=${float(closed_trade.get('pnl_usd', 0.0)):.2f} | Equity=${float(closed_trade.get('updated_equity', self.risk_engine.equity)):.2f}",
+            flush=True
+        )
 
     async def _evaluate_new_dollar_bar(self, symbol: str, new_bar: dict, is_initial: bool = False):
         """
@@ -424,14 +456,38 @@ class LiveShadowTrialRunner:
                     # Enforce a hard exchange-verified check before placing any entry order
                     if self.testnet_client:
                         live_pos = await self.sync_live_exchange_positions()
+                        raw_positions = await self.testnet_client.get_position_risk()
+                        existing_sym_pos = next(
+                            (p for p in raw_positions if p.get("symbol") == symbol and abs(float(p.get("positionAmt", 0.0))) > 0),
+                            None
+                        )
+
+                        if existing_sym_pos is not None:
+                            amt = abs(float(existing_sym_pos.get("positionAmt", 0.0)))
+                            entry_p = float(existing_sym_pos.get("entryPrice", 0.0))
+                            notional = amt * entry_p
+                            if amt > 0 or notional > 100.0:
+                                order_status = f"SKIPPED_ALREADY_IN_POSITION_FOR_{symbol}"
+
+                        if order_status == "NO_PRIMARY_BREAKOUT":
+                            active_syms = [
+                                p.get("symbol") for p in raw_positions
+                                if abs(float(p.get("positionAmt", 0.0))) > 0 and p.get("symbol") in self.symbols
+                            ]
+                            if len(active_syms) >= 4:
+                                order_status = "FILTERED_MAX_CONCURRENT_POSITIONS_REACHED"
+                            else:
+                                open_orders = await self.testnet_client.get_open_orders(symbol)
+                                if open_orders and len(open_orders) > 0:
+                                    order_status = f"SKIPPED_ALREADY_HAVE_RESTING_ORDERS_FOR_{symbol}"
                     else:
                         live_pos = self.risk_engine.active_positions
+                        if len(live_pos) >= 4:
+                            order_status = "FILTERED_MAX_CONCURRENT_POSITIONS_REACHED"
+                        elif symbol in live_pos:
+                            order_status = f"SKIPPED_POSITION_ALREADY_OPEN_FOR_{symbol}"
 
-                    if len(live_pos) >= 4:
-                        order_status = "FILTERED_MAX_CONCURRENT_POSITIONS_REACHED"
-                    elif symbol in live_pos:
-                        order_status = f"SKIPPED_POSITION_ALREADY_OPEN_FOR_{symbol}"
-                    else:
+                    if order_status == "NO_PRIMARY_BREAKOUT":
                         target_side = primary_side if ign_trigger else (1 if deliberation.proposal.action == "BUY" else -1)
                         effective_prob = meta_prob if ign_trigger else deliberation.conviction_score
                         trigger_reason = "IGNITION_BREAKOUT" if ign_trigger else "TRADING_AGENTS_PM_APPROVED"
@@ -492,12 +548,14 @@ class LiveShadowTrialRunner:
 
                                     # 2. Portfolio Capital Cap & Sizing Governor (Max $1,000 USDT notional, max 10% equity)
                                     raw_qty = float(decision.get("qty_btc", 0.001))
-                                    max_single_notional = min(1000.0, self.risk_engine.equity * 0.10)
+                                    max_single_notional = min(1000.0, max(500.0, self.risk_engine.equity * 0.10))
                                     if raw_qty * limit_price > max_single_notional:
                                         raw_qty = max_single_notional / limit_price
                                     if raw_qty * limit_price < 50.0:
                                         raw_qty = min(55.0 / limit_price, max_single_notional / limit_price)
                                     qty = format_order_qty(symbol, raw_qty)
+                                    if float(qty) * limit_price > 1000.0:
+                                        qty = format_order_qty(symbol, 995.0 / limit_price)
 
                                     testnet_order = await self.testnet_client.place_order(
                                         symbol=symbol,
@@ -643,9 +701,51 @@ class LiveShadowTrialRunner:
             except Exception as e:
                 print(f"[GARBAGE COLLECTOR LOOP ERROR] {e}", flush=True)
 
+    async def _exchange_sync_watchdog_loop(self) -> None:
+        """
+        Runs every 30 seconds to:
+        1. Synchronize live exchange positions with paper risk engine.
+        2. Ensure every active exchange position has active STOP_MARKET and TAKE_PROFIT_MARKET protection orders.
+        """
+        while True:
+            try:
+                await asyncio.sleep(30.0)
+                if not self.testnet_client:
+                    continue
+
+                live_positions = await self.sync_live_exchange_positions()
+                for sym, pos_info in live_positions.items():
+                    amt = float(pos_info.get("amt", 0.0))
+                    if abs(amt) <= 0.0:
+                        continue
+                    entry_p = float(pos_info.get("entry_price", 0.0))
+                    pos_side = "BUY" if amt > 0 else "SELL"
+
+                    open_orders = await self.testnet_client.get_open_orders(sym)
+                    has_sl = any(o.get("type") in ("STOP_MARKET", "STOP") for o in open_orders)
+                    has_tp = any(o.get("type") in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT") for o in open_orders)
+
+                    if not has_sl or not has_tp:
+                        print(f"[WATCHDOG] {sym} is missing protection orders (SL={has_sl}, TP={has_tp}). Submitting now...", flush=True)
+                        tp_sl_res = await self.testnet_client.place_tp_sl_orders(
+                            symbol=sym,
+                            side=pos_side,
+                            entry_price=entry_p,
+                            rolling_vol=0.0020
+                        )
+                        self._log_event("WATCHDOG_TP_SL_REPLACED", {
+                            "symbol": sym,
+                            "side": pos_side,
+                            "entry_price": entry_p,
+                            "result": tp_sl_res
+                        })
+            except Exception as e:
+                print(f"[WATCHDOG ERROR] {e}", flush=True)
+
     async def run_forever(self):
         asyncio.create_task(self._background_deliberation_loop())
         asyncio.create_task(self._orphan_order_cleaner_loop())
+        asyncio.create_task(self._exchange_sync_watchdog_loop())
 
         if self.testnet_client:
             print(f"[TESTNET INIT] Syncing account equity & enforcing 2x ISOLATED margin...", flush=True)
@@ -728,21 +828,7 @@ class LiveShadowTrialRunner:
                                 trade_price, self.current_bar_idx[symbol], is_bar_close=False, symbol=symbol
                             )
                             if closed_trade is not None:
-                                self._log_event("SHADOW_POSITION_CLOSED", {**closed_trade, "symbol": symbol})
-                                trading_agents_pipeline.settle_position(
-                                    symbol=symbol,
-                                    exit_pnl=float(closed_trade.get("pnl_usd", 0.0)),
-                                    exit_reason=str(closed_trade.get("exit_reason", "INTRABAR_EXIT")),
-                                    net_return_bps=float(closed_trade.get("net_return_bps", 0.0)),
-                                )
-                                if self.testnet_client and symbol not in self.open_positions:
-                                    asyncio.create_task(self.testnet_client.cancel_all_open_orders(symbol))
-                                print(
-                                    f"[TRADE CLOSED (INTRABAR)] Symbol={symbol} Reason={closed_trade['exit_reason']} | "
-                                    f"ExitPrice={closed_trade['exit_price']} | NetReturn={closed_trade['net_return_bps']}bps | "
-                                    f"PnL=${closed_trade['pnl_usd']:.2f} | Equity=${closed_trade['updated_equity']:.2f}",
-                                    flush=True
-                                )
+                                await self._handle_barrier_exit(symbol, closed_trade)
 
                             # 2. Accumulate tick in Dollar Bar engine for THIS symbol
                             bar = self.bar_engines[symbol].process_agg_trade(
@@ -761,21 +847,7 @@ class LiveShadowTrialRunner:
                                     float(bar["close"]), self.current_bar_idx[symbol], is_bar_close=True, symbol=symbol
                                 )
                                 if closed_trade_bar is not None:
-                                    self._log_event("SHADOW_POSITION_CLOSED", {**closed_trade_bar, "symbol": symbol})
-                                    trading_agents_pipeline.settle_position(
-                                        symbol=symbol,
-                                        exit_pnl=float(closed_trade_bar.get("pnl_usd", 0.0)),
-                                        exit_reason=str(closed_trade_bar.get("exit_reason", "BAR_CLOSE_EXIT")),
-                                        net_return_bps=float(closed_trade_bar.get("net_return_bps", 0.0)),
-                                    )
-                                    if self.testnet_client and symbol not in self.open_positions:
-                                        asyncio.create_task(self.testnet_client.cancel_all_open_orders(symbol))
-                                    print(
-                                        f"[TRADE CLOSED (BAR CLOSE)] Symbol={symbol} Reason={closed_trade_bar['exit_reason']} | "
-                                        f"ExitPrice={closed_trade_bar['exit_price']} | NetReturn={closed_trade_bar['net_return_bps']}bps | "
-                                        f"PnL=${closed_trade_bar['pnl_usd']:.2f} | Equity=${closed_trade_bar['updated_equity']:.2f}",
-                                        flush=True
-                                    )
+                                    await self._handle_barrier_exit(symbol, closed_trade_bar)
 
                                 # 4. Evaluate new Dollar Bar strictly for this symbol
                                 await self._evaluate_new_dollar_bar(symbol, bar)

@@ -477,6 +477,98 @@ class BinanceFuturesTestnetClient:
 
         return results
 
+    async def close_position_market(self, symbol: str) -> Dict[str, Any]:
+        """
+        Executes a real MARKET counter-order with reduceOnly=true on Binance Testnet
+        for the specified symbol and verifies positionAmt == 0.
+        Cancels open TP/SL protection orders once the position is confirmed closed.
+        """
+        if not self.is_time_synced:
+            await self.sync_server_time()
+
+        sym = symbol.upper()
+        positions = await self.get_position_risk()
+        pos = next((p for p in positions if p.get("symbol") == sym and abs(float(p.get("positionAmt", 0.0))) > 0), None)
+
+        if not pos:
+            # Already closed on exchange
+            await self.cancel_all_open_orders(sym)
+            return {"status": "ALREADY_CLOSED", "symbol": sym, "positionAmt": 0.0, "closed": True}
+
+        amt = float(pos.get("positionAmt", 0.0))
+        counter_side = "SELL" if amt > 0 else "BUY"
+        qty_str = format_order_qty(sym, abs(amt))
+
+        session = await self._get_session()
+        headers = self._get_headers()
+        params = self._sign_payload({
+            "symbol": sym,
+            "side": counter_side,
+            "type": "MARKET",
+            "quantity": qty_str,
+            "reduceOnly": "true",
+        })
+        url = f"{self.base_url}/fapi/v1/order?{urlencode(params)}"
+
+        order_res = {}
+        try:
+            async with session.post(url, headers=headers) as resp:
+                order_res = await resp.json()
+                logger.info("close_position_market response for %s: %s", sym, order_res)
+        except Exception as e:
+            logger.error("Failed to post market close order for %s: %s", sym, e)
+            return {"status": "ERROR", "symbol": sym, "error": str(e), "closed": False}
+
+        # Verify on exchange that positionAmt == 0
+        await asyncio.sleep(0.5)
+        pos_after = await self.get_position_risk()
+        remaining_pos = next((p for p in pos_after if p.get("symbol") == sym), None)
+        rem_amt = float(remaining_pos.get("positionAmt", 0.0)) if remaining_pos else 0.0
+
+        is_closed = (abs(rem_amt) == 0.0)
+        if is_closed:
+            await self.cancel_all_open_orders(sym)
+
+        return {
+            "status": "SUCCESS" if is_closed else "PARTIAL",
+            "symbol": sym,
+            "closed": is_closed,
+            "remaining_amt": rem_amt,
+            "order_response": order_res,
+        }
+
+    async def get_realized_income(self, symbol: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Queries /fapi/v1/income for incomeType=REALIZED_PNL.
+        """
+        if not self.is_time_synced:
+            await self.sync_server_time()
+
+        if not self.api_key or not self.api_secret:
+            return []
+
+        payload: Dict[str, Any] = {
+            "incomeType": "REALIZED_PNL",
+            "limit": min(limit, 1000)
+        }
+        if symbol:
+            payload["symbol"] = symbol.upper()
+
+        params = self._sign_payload(payload)
+        session = await self._get_session()
+        headers = self._get_headers()
+        url = f"{self.base_url}/fapi/v1/income?{urlencode(params)}"
+
+        try:
+            async with session.get(url, headers=headers) as resp:
+                data = await resp.json()
+                if isinstance(data, list):
+                    return data
+                return []
+        except Exception as e:
+            logger.error("Error fetching realized income: %s", e)
+            return []
+
     async def cancel_all_open_orders(self, symbol: str = "BTCUSDT") -> Dict[str, Any]:
         """
         Cancels all active resting quotes and algorithmic TP/SL orders on Binance Futures Testnet.
